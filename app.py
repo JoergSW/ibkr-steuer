@@ -823,7 +823,7 @@ zuflussprinzip_aktiv = False
 if has_cross_year:
     zufluss_parts = []
     if cross_year_details:
-        zufluss_parts.append(f"{len(cross_year_details)} Assignment-Prämie(n) aus Vorjahren ({fmt_de(cross_year_premium)} EUR)")
+        zufluss_parts.append(f"{len(cross_year_details)} Assignment-Prämienanteil(e) aus Vorjahren ({fmt_de(cross_year_premium)} EUR)")
     if zufluss_details:
         zufluss_parts.append(f"{len(zufluss_details)} offene Stillhalter-Position(en) mit Zufluss im Steuerjahr ({fmt_de(zufluss_premium)} EUR, bereits in Berechnung enthalten)")
     if prior_zufluss_details:
@@ -1948,7 +1948,7 @@ Tageskurs-Methode: PnL (EUR) = Erlös × FX_Verkaufstag − AK × FX_Kauftag
 |---|---|---|---|
 | `STK` | `COMMON` / `REIT` / `ADR` | Aktienveräußerung (§20 Abs. 2 Nr. 1) | **Topf 1** |
 | `STK` | `ETF` (InvStG-Fonds) | Investmentfonds (InvStG §2) | **KAP-INV** (optional) |
-| `STK` | `ETF` (no\_invstg, z.B. IBIT) | Wie Einzelaktie | **Topf 1** |
+| `STK` | `ETF` (no\\_invstg, z.B. IBIT) | Wie Einzelaktie | **Topf 1** |
 | `OPT` | | Termingeschäft, Option (§20 Abs. 2 Nr. 3) | Topf 2 |
 | `FUT` | | Termingeschäft, Future (§20 Abs. 2 Nr. 3) | Topf 2 |
 | `FOP` / `FSFOP` | | Termingeschäft, Future-Option (§20 Abs. 2 Nr. 3) | Topf 2 |

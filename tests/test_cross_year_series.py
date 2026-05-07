@@ -1,10 +1,13 @@
-"""Synthetischer Regression-Test fuer GH Issue #61.
+"""Synthetischer Regression-Test fuer GH Issues #61 und #62.
 
 Cross-Year-Same-Series-FIFO-Konflikt: Wenn dieselbe Option-Series sowohl im
 Vorjahr als auch im Steuerjahr angedient wurde, hat der Same-Year-Block frueher
 faelschlich die aeltesten Sells konsumiert (die im Vorjahres-Lauf bereits
 versteuert waren). Pre-consume im _current_year_series_state-Build verschiebt
 den FIFO-Startpunkt auf die juengeren Sells.
+
+Mixed-Year-Konsum: Wenn eine Steuerjahr-Andienung Sells aus mehreren Jahren
+konsumiert, muss nur der Vorjahresanteil als cross-year gelten.
 
 Aufruf: python tests/test_cross_year_series.py
 """
@@ -14,6 +17,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from calculate_tax_report import (
+    _build_stillhalter_details_for_assignment,
     _consume_open_sells_fifo,
     _get_open_option_sells,
     safe_float,
@@ -224,8 +228,50 @@ def test_steueryahr_only_no_op():
     print(f"  TC3 Steuerjahr-only no-op: OK (consumed Sell {consumed_dates[0]})")
 
 
+def test_mixed_year_assignment_splits_cross_year_premium():
+    """TC4: Eine Steuerjahr-Andienung konsumiert Sells aus zwei Jahren.
+
+    Nur der 2023-Anteil darf cross-year sein. Vor Issue #62 wurde wegen des
+    fruehesten orig_sell_date die komplette Assignment-Praemie markiert.
+    """
+    trades = [
+        make_sell("2023-06-15", 2, 3.00),
+        make_sell("2024-03-15", 5, 5.00),
+        make_assignment("2024-04-15", 7),
+    ]
+    assignment = trades[-1]
+    state = _get_open_option_sells(
+        trades, "OPT", "100", "2024-12-20", "P", 7, underlying="TEST"
+    )
+    premium_raw, commission_raw, _fx, premium_eur, sells_consumed, consumed = _consume_open_sells_fifo(
+        state, a_qty=7, mult=100, base_currency="EUR"
+    )
+    assert consumed == 7
+
+    details = _build_stillhalter_details_for_assignment(
+        assignment, "100", "2024-12-20", "P", 7, 100, 2024,
+        sells_consumed, premium_raw, commission_raw, premium_eur, base_currency="EUR"
+    )
+
+    assert len(details) == 2, f"erwartet 2 Detail-Splits, aktuell {len(details)}"
+    by_year = {d["orig_sell_year"]: d for d in details}
+    assert by_year[2023]["quantity"] == 2
+    assert by_year[2024]["quantity"] == 5
+    assert by_year[2023]["is_cross_year"] is True
+    assert by_year[2024]["is_cross_year"] is False
+
+    cross_year_premium = sum(d["premium_eur"] for d in details if d["is_cross_year"])
+    detail_total = sum(d["premium_eur"] for d in details)
+    assert_close(cross_year_premium, 2 * 3 * 100 - 1, label="TC4 cross_year_premium")
+    assert_close(detail_total, premium_eur, label="TC4 detail_total")
+
+    print("  TC4 Mixed-Year-Assignment-Split: OK")
+    print(f"    Cross-Year-Praemie = {cross_year_premium:.2f} EUR, Gesamt = {detail_total:.2f} EUR")
+
+
 if __name__ == "__main__":
     test_cross_year_put_series()
     test_cross_year_call_series()
     test_steueryahr_only_no_op()
-    print("\nOK: alle 3 TCs gruen")
+    test_mixed_year_assignment_splits_cross_year_premium()
+    print("\nOK: alle 4 TCs gruen")

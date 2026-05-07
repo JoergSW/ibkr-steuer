@@ -167,10 +167,10 @@ def run_tests():
     if failed > 0:
         sys.exit(1)
 
-    # Synthetische Cross-Year-Series-Tests (Issue #61). Real-Audit-Daten enthalten
-    # 0 Cross-Year-Same-Series; daher synthetische TCs fuer Bug-Coverage.
+    # Synthetische Cross-Year-Series-Tests (Issues #61/#62). Real-Audit-Daten enthalten
+    # 0 Cross-Year-Same-Series bzw. Mixed-Year-Konsum; daher synthetische TCs fuer Bug-Coverage.
     print(f"\n{'-'*60}")
-    print("Synthetische Cross-Year-Series-Tests (Issue #61)")
+    print("Synthetische Cross-Year-Series-Tests (Issues #61/#62)")
     sys.stdout.flush()
     rc = os.system("python tests/test_cross_year_series.py")
     if rc != 0:

@@ -464,32 +464,117 @@ def _consume_open_sells_fifo(originals_state, a_qty, mult, base_currency='EUR', 
         if q_avail <= 0:
             continue
         consume = min(remaining, q_avail)
-        price = safe_float(orig.get('tradePrice')) or safe_float(orig.get('closePrice'))
-        if price <= 0:
+        components = _premium_components_for_consumed_sell(
+            orig, consume, mult, base_currency, usd_to_eur_rates
+        )
+        if components is None:
             orig['_open_qty'] = q_avail - consume
             remaining -= consume
             continue
-        orig_full_qty = abs(int(safe_float(orig.get('quantity'))))
-        comm_full = safe_float(orig.get('ibCommission'), 0)
-        comm_share = comm_full * consume / orig_full_qty if orig_full_qty else 0
-        fill_premium_raw = price * mult * consume
-        fill_net_raw = fill_premium_raw + comm_share
-        fx = safe_float(orig.get('fxRateToBase'), 1.0)
-        if base_currency == 'EUR':
-            fill_eur = fill_net_raw * fx
-        else:
-            sd = parse_date(orig.get('dateTime') or orig.get('tradeDate'))
-            r_eur = get_rate_for_date(sd, usd_to_eur_rates) if usd_to_eur_rates else 1.0
-            fill_eur = fill_net_raw * fx * r_eur
-        premium_raw += fill_premium_raw
-        commission_raw += comm_share
-        fx_weighted += fx * consume
-        premium_eur += fill_eur
+        premium_raw += components['premium_raw']
+        commission_raw += components['commission_raw']
+        fx_weighted += components['fx_weighted']
+        premium_eur += components['premium_eur']
         consumed += consume
         sells_consumed.append((orig, consume))
         orig['_open_qty'] = q_avail - consume
         remaining -= consume
     return premium_raw, commission_raw, fx_weighted, premium_eur, sells_consumed, consumed
+
+
+def _premium_components_for_consumed_sell(orig, consume, mult, base_currency='EUR', usd_to_eur_rates=None):
+    """Return premium components for a consumed SELL slice."""
+    price = safe_float(orig.get('tradePrice')) or safe_float(orig.get('closePrice'))
+    if price <= 0 or consume <= 0:
+        return None
+    orig_full_qty = abs(int(safe_float(orig.get('quantity'))))
+    comm_full = safe_float(orig.get('ibCommission'), 0)
+    comm_share = comm_full * consume / orig_full_qty if orig_full_qty else 0
+    premium_raw = price * mult * consume
+    net_raw = premium_raw + comm_share
+    fx = safe_float(orig.get('fxRateToBase'), 1.0)
+    if base_currency == 'EUR':
+        premium_eur = net_raw * fx
+    else:
+        sd = parse_date(orig.get('dateTime') or orig.get('tradeDate'))
+        r_eur = get_rate_for_date(sd, usd_to_eur_rates) if usd_to_eur_rates else 1.0
+        premium_eur = net_raw * fx * r_eur
+    return {
+        'quantity': consume,
+        'premium_raw': premium_raw,
+        'commission_raw': comm_share,
+        'net_premium_raw': net_raw,
+        'fx_weighted': fx * consume,
+        'premium_eur': premium_eur,
+    }
+
+
+def _build_stillhalter_details_for_assignment(a, strike, expiry, pc, a_qty, mult, tax_year,
+                                              sells_consumed, premium_raw, commission_raw,
+                                              premium_eur, base_currency='EUR',
+                                              usd_to_eur_rates=None):
+    """Build assignment details split by original SELL year."""
+    assignment_date = parse_date(a.get('dateTime') or a.get('tradeDate'))
+    detail_parts = {}
+    for orig, consume_qty in sells_consumed:
+        od = parse_date(orig.get('dateTime') or orig.get('tradeDate'))
+        components = _premium_components_for_consumed_sell(
+            orig, consume_qty, mult, base_currency, usd_to_eur_rates
+        )
+        if components is None:
+            continue
+        if od is None:
+            od = assignment_date
+        if od is None:
+            continue
+        yr = od.year
+        if yr not in detail_parts:
+            detail_parts[yr] = {
+                'orig_sell_date': od,
+                'quantity': 0,
+                'premium_eur': 0.0,
+                'premium_raw': 0.0,
+                'commission_raw': 0.0,
+            }
+        part = detail_parts[yr]
+        if od < part['orig_sell_date']:
+            part['orig_sell_date'] = od
+        part['quantity'] += components['quantity']
+        part['premium_eur'] += components['premium_eur']
+        part['premium_raw'] += components['net_premium_raw']
+        part['commission_raw'] += components['commission_raw']
+
+    if not detail_parts:
+        detail_parts[tax_year] = {
+            'orig_sell_date': assignment_date,
+            'quantity': a_qty,
+            'premium_eur': premium_eur,
+            'premium_raw': premium_raw + commission_raw,
+            'commission_raw': commission_raw,
+        }
+
+    def _detail_sort_key(item):
+        d = item[1]['orig_sell_date'] or assignment_date
+        return str(d) if d else ''
+
+    details = []
+    for yr, part in sorted(detail_parts.items(), key=_detail_sort_key):
+        details.append({
+            'symbol': a.get('symbol') or a.get('description') or f"{strike} {expiry} {pc}",
+            'strike': strike,
+            'expiry': expiry,
+            'putCall': pc,
+            'quantity': part['quantity'],
+            'multiplier': mult,
+            'premium_eur': part['premium_eur'],
+            'premium_raw': part['premium_raw'],
+            'commission_raw': part['commission_raw'],
+            'assignment_date': str(assignment_date) if assignment_date else '',
+            'orig_sell_date': str(part['orig_sell_date']) if part['orig_sell_date'] else '',
+            'orig_sell_year': yr,
+            'is_cross_year': yr < tax_year,
+        })
+    return details
 
 
 def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrides=None):
@@ -956,36 +1041,13 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         if consumed_qty == 0 or premium_raw == 0:
             continue
 
-        net_premium_raw = premium_raw + commission_raw
-        fx_to_base = fx_weighted / consumed_qty if consumed_qty else 1.0  # nur Display
-
         stillhalter_premium_eur += premium_eur
         stillhalter_count += 1
 
-        # Collect per-assignment details for Zuflussprinzip
-        # Issue #53: orig_sell_date aus tatsaechlich konsumierten Sells, nicht aus
-        # allen offenen — sonst wird is_cross_year bei Mehrfach-Andienungen verfaelscht.
-        orig_sell_date = None
-        for orig, _consume_qty in sells_consumed:
-            od = parse_date(orig.get('dateTime') or orig.get('tradeDate'))
-            if od is not None and (orig_sell_date is None or od < orig_sell_date):
-                orig_sell_date = od
-        assignment_date = parse_date(a.get('dateTime') or a.get('tradeDate'))
-        stillhalter_details.append({
-            'symbol': a.get('symbol') or a.get('description') or f"{strike} {expiry} {pc}",
-            'strike': strike,
-            'expiry': expiry,
-            'putCall': pc,
-            'quantity': a_qty,
-            'multiplier': mult,
-            'premium_eur': premium_eur,
-            'premium_raw': net_premium_raw,
-            'commission_raw': commission_raw,
-            'assignment_date': str(assignment_date) if assignment_date else '',
-            'orig_sell_date': str(orig_sell_date) if orig_sell_date else '',
-            'orig_sell_year': orig_sell_date.year if orig_sell_date else tax_year,
-            'is_cross_year': (orig_sell_date.year < tax_year) if orig_sell_date else False,
-        })
+        stillhalter_details.extend(_build_stillhalter_details_for_assignment(
+            a, strike, expiry, pc, a_qty, mult, tax_year, sells_consumed,
+            premium_raw, commission_raw, premium_eur, base_currency, usd_to_eur_rates
+        ))
 
     # Move premiums from Topf 1 (stocks) / KAP-INV to Topf 2 (sonstiges)
     # For CALL assignments: IBKR embeds premium in stock SELL PnL → subtract from stocks_gain
@@ -3098,4 +3160,3 @@ if __name__ == "__main__":
         ib_tax_dir = './'
         
     calculate_tax(ib_tax_dir)
-

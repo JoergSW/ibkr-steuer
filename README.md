@@ -16,7 +16,7 @@ Automatische Berechnung der Anlage KAP und KAP-INV aus Interactive Brokers Flex 
 - **Vorjahres-XMLs** - Cross-Year Stillhalter-Matching (Option verkauft 2024, Assignment 2025)
 - **Plausibilitätscheck** - Vergleich der berechneten Werte gegen IBKRs eigene Zusammenfassung
 - Optionen, Futures, T-Bills, Anleihen, Dividenden, Zinsen, Stückzinsen, PIL
-- Quellensteuer-Anrechnung (Zeile 41)
+- Ausländische Quellensteuer-Anrechnung (Zeile 41) und separate Erkennung deutscher Dividendensteuer (Zeile 7/37/38)
 - Detaillierte Berechnungsschritte und steuerliche Regeln direkt in der App
 - Textreport-Download für die Steuererklärung
 

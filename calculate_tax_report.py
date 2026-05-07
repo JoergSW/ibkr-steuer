@@ -25,6 +25,31 @@ def safe_float(val, default=0.0):
         return default
     return float(val)
 
+GERMAN_DIVIDEND_TAX_TOTAL_RATE = 0.26375
+GERMAN_KEST_RATE = 0.25
+GERMAN_SOLI_RATE = 0.01375
+
+def is_de_isin(row):
+    return row.get('isin', '').strip().upper().startswith('DE')
+
+def funds_match_key(row):
+    return (
+        row.get('reportDate') or row.get('date') or '',
+        row.get('isin', '').strip().upper(),
+        row.get('symbol', '').strip().upper(),
+    )
+
+def is_german_dividend_tax_row(row):
+    desc = (row.get('activityDescription') or '').lower()
+    code = (row.get('activityCode') or '').strip().upper()
+    has_de_tax_marker = (
+        'de steuer' in desc
+        or 'de tax' in desc
+        or '- de steuer' in desc
+        or '- de tax' in desc
+    )
+    return is_de_isin(row) and has_de_tax_marker and (code in ('', 'FRTAX', 'WHT'))
+
 def get_exchange_rates(trades, funds):
     # Map Date -> USD_to_EUR rate
     # fxRateToBase for EUR records = EUR -> USD (e.g. 1.05 means 1 EUR = 1.05 USD)
@@ -1986,19 +2011,28 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     # --- PLAUSIBILITY: Raw Sums for Reconciliation ---
     # Use reportDate (booking date) for year assignment — Zuflussprinzip (§11 EStG)
     raw_div_base = sum(safe_float(f.get('amount')) for f in funds if f.get('activityCode') == 'DIV' and (d := parse_date(f.get('reportDate') or f.get('date'))) is not None and d.year == tax_year)
-    raw_tax_base = sum(safe_float(f.get('amount')) for f in funds if f.get('activityCode') in ['FRTAX', 'WHT'] and (d := parse_date(f.get('reportDate') or f.get('date'))) is not None and d.year == tax_year)
+    raw_tax_base = sum(safe_float(f.get('amount')) for f in funds if (f.get('activityCode') in ['FRTAX', 'WHT'] or is_german_dividend_tax_row(f)) and (d := parse_date(f.get('reportDate') or f.get('date'))) is not None and d.year == tax_year)
 
     # 4. Dividends, Interest, and Withholding Tax
     dividends_eur = 0.0
+    domestic_taxed_dividends_eur = 0.0
     interest_eur = 0.0  # Bond coupons, credit interest, Stückzinsen (abzugsfähig)
     debit_interest_eur = 0.0  # Margin-Sollzinsen, Leihgebühren (NICHT abzugsfähig, §20 Abs. 9 EStG)
     withholding_tax_eur = 0.0
+    domestic_withholding_tax_eur = 0.0
+
+    german_dividend_tax_keys = {
+        funds_match_key(f) for f in funds
+        if is_german_dividend_tax_row(f)
+    }
 
     funds_processed = 0
     funds_skipped_year = 0
 
     for f in funds:
         code = f.get('activityCode')
+        if not code and is_german_dividend_tax_row(f):
+            code = 'FRTAX'
         # DIV = Dividends, PIL = Payment in Lieu (short dividends)
         # INTR = Bond Coupon/Interest, CINT = Credit Interest
         # INTP = Accrued Interest Paid (Stückzinsen)
@@ -2058,6 +2092,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                     info = get_etf_info(fund_isin)
                     etf_by_isin[fund_isin] = {'ticker': info['ticker'] if info else fund_isin[:12], 'name': info['name'] if info else '', 'classification': cls or 'sonstiger_fonds', 'gain': 0.0, 'loss': 0.0, 'div': 0.0, 'wht': 0.0}
                 etf_by_isin[fund_isin]['div'] += amount_eur
+            elif is_de_isin(f) and funds_match_key(f) in german_dividend_tax_keys:
+                domestic_taxed_dividends_eur += amount_eur
             else:
                 dividends_eur += amount_eur
         elif code == 'PIL':
@@ -2070,6 +2106,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                     info = get_etf_info(fund_isin)
                     etf_by_isin[fund_isin] = {'ticker': info['ticker'] if info else fund_isin[:12], 'name': info['name'] if info else '', 'classification': cls or 'sonstiger_fonds', 'gain': 0.0, 'loss': 0.0, 'div': 0.0, 'wht': 0.0}
                 etf_by_isin[fund_isin]['div'] += amount_eur
+            elif is_de_isin(f) and funds_match_key(f) in german_dividend_tax_keys:
+                domestic_taxed_dividends_eur += amount_eur
             else:
                 dividends_eur += amount_eur
         elif code == 'DINT':
@@ -2084,7 +2122,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             # Tax is usually negative. We want the absolute value of the NET tax paid.
             # If there are adjustments/refunds (positive), they reduce the total tax.
             # We track the sum directly and take the absolute value later.
-            if is_etf_fund:
+            if is_german_dividend_tax_row(f) and not is_etf_fund:
+                domestic_withholding_tax_eur += amount_eur
+            elif is_etf_fund:
                 etf_wht_eur += amount_eur
                 if fund_isin in etf_by_isin:
                     etf_by_isin[fund_isin]['wht'] += amount_eur
@@ -2093,6 +2133,19 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             
     # Finalize tax: convert net sum to absolute value for "Tax Paid" field
     withholding_tax_eur = abs(withholding_tax_eur)
+    domestic_withholding_tax_eur = abs(domestic_withholding_tax_eur)
+    zeile_37_kapitalertragsteuer_eur = (
+        domestic_withholding_tax_eur
+        * GERMAN_KEST_RATE
+        / GERMAN_DIVIDEND_TAX_TOTAL_RATE
+        if domestic_withholding_tax_eur else 0.0
+    )
+    zeile_38_solidaritaetszuschlag_eur = (
+        domestic_withholding_tax_eur
+        * GERMAN_SOLI_RATE
+        / GERMAN_DIVIDEND_TAX_TOTAL_RATE
+        if domestic_withholding_tax_eur else 0.0
+    )
             
     # --- Fallback: Realized PnL from Summary ---
     # Use ISIN to identify already-processed instruments (trades.csv lacks 'symbol')
@@ -2929,16 +2982,20 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     )
 
     report_data = {
+        "zeile_7_kapitalertraege_mit_inlaendischem_steuerabzug_eur": domestic_taxed_dividends_eur,
         "zeile_19_netto_eur": zeile_19_netto,
         "zeile_20_stock_gains_eur": zeile_20_stock_gains,
         "zeile_22_other_losses_eur": zeile_22_other_losses,
         "zeile_23_stock_losses_eur": zeile_23_stock_losses,
+        "zeile_37_kapitalertragsteuer_eur": zeile_37_kapitalertragsteuer_eur,
+        "zeile_38_solidaritaetszuschlag_eur": zeile_38_solidaritaetszuschlag_eur,
         "zeile_41_withholding_tax_eur": withholding_tax_eur,
         # Pool details
         "topf_1_aktien_netto": topf_1_aktien,
         "topf_2_sonstiges_netto": topf_2_sonstiges,
         # Keep old keys for backward compatibility
         "dividends_eur": dividends_eur,
+        "domestic_taxed_dividends_eur": domestic_taxed_dividends_eur,
         "interest_eur": interest_eur,
         "debit_interest_eur": debit_interest_eur,
         "stocks_gain_eur": stocks_gain,
@@ -2949,6 +3006,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         "options_net_eur": options_gain + options_loss,
         "topf2_by_category": topf2_by_category,
         "withholding_tax_eur": withholding_tax_eur,
+        "domestic_withholding_tax_eur": domestic_withholding_tax_eur,
         "base_currency": base_currency,
         "tax_year": tax_year,
         # FX currency gains/losses
@@ -3037,6 +3095,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     print("-" * 60)
     print("TOPF 2: SONSTIGES (inkl. Termingeschäfte)")
     print(f"    Dividenden (netto):    {dividends_eur:>12,.2f} EUR")
+    if domestic_taxed_dividends_eur > 0.01:
+        print(f"    DE-Dividenden m. StAbz:{domestic_taxed_dividends_eur:>12,.2f} EUR  (separat Zeile 7)")
     print(f"    Zinsen:                {interest_eur:>12,.2f} EUR")
     if abs(debit_interest_eur) > 0.01:
         print(f"    Sollzinsen (n. abzf.): {debit_interest_eur:>12,.2f} EUR  (§20 Abs. 9 EStG, nicht in Berechnung)")
@@ -3112,10 +3172,14 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         print(f"    KAP-INV (ETF netto):   {etf_net_taxable:>12,.2f} EUR")
     
     print("-" * 60)
+    if domestic_taxed_dividends_eur > 0.01:
+        print(f"ZEILE 7 (Kapitalerträge mit inländischem Steuerabzug): {domestic_taxed_dividends_eur:>12,.2f} EUR")
+        print(f"ZEILE 37 (Kapitalertragsteuer):                       {zeile_37_kapitalertragsteuer_eur:>12,.2f} EUR")
+        print(f"ZEILE 38 (Solidaritätszuschlag):                      {zeile_38_solidaritaetszuschlag_eur:>12,.2f} EUR")
     print(f"ZEILE 20 (Davon: Aktiengewinne):   {zeile_20_stock_gains:>12,.2f} EUR")
     print(f"ZEILE 22 (Verluste ohne Aktien):   {zeile_22_other_losses:>12,.2f} EUR")
     print(f"ZEILE 23 (Aktienverluste):         {zeile_23_stock_losses:>12,.2f} EUR")
-    print(f"ZEILE 41 (Quellensteuer):          {withholding_tax_eur:>12,.2f} EUR")
+    print(f"ZEILE 41 (ausländische Quellensteuer): {withholding_tax_eur:>12,.2f} EUR")
 
     if abs(fx_correction_total) > 0.01:
         corrected_z19 = zeile_19_netto + fx_correction_total

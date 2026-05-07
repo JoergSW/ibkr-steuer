@@ -357,6 +357,7 @@ def merge_report_data(reports):
 
     # Simple sum fields
     for field in ['stocks_gain_eur', 'stocks_loss_eur', 'dividends_eur', 'interest_eur',
+                  'domestic_taxed_dividends_eur', 'domestic_withholding_tax_eur',
                   'debit_interest_eur', 'options_gain_eur', 'options_loss_eur',
                   'withholding_tax_eur', 'fx_total_gain', 'fx_total_loss', 'fx_translation',
                   'fx_correction_total']:
@@ -371,6 +372,9 @@ def merge_report_data(reports):
     merged['zeile_20_stock_gains_eur'] = sum(r.get('zeile_20_stock_gains_eur', 0) for r in reports)
     merged['zeile_22_other_losses_eur'] = sum(r.get('zeile_22_other_losses_eur', 0) for r in reports)
     merged['zeile_23_stock_losses_eur'] = sum(r.get('zeile_23_stock_losses_eur', 0) for r in reports)
+    merged['zeile_7_kapitalertraege_mit_inlaendischem_steuerabzug_eur'] = merged['domestic_taxed_dividends_eur']
+    merged['zeile_37_kapitalertragsteuer_eur'] = sum(r.get('zeile_37_kapitalertragsteuer_eur', 0) for r in reports)
+    merged['zeile_38_solidaritaetszuschlag_eur'] = sum(r.get('zeile_38_solidaritaetszuschlag_eur', 0) for r in reports)
     merged['zeile_41_withholding_tax_eur'] = merged['withholding_tax_eur']
 
     # Scalars (from first report)
@@ -775,6 +779,9 @@ zeile_19      = d.get('zeile_19_netto_eur', topf_1 + topf_2)
 zeile_20      = d.get('zeile_20_stock_gains_eur', d.get('stocks_gain_eur', 0))
 zeile_22      = d.get('zeile_22_other_losses_eur', abs(d.get('options_loss_eur', 0)))
 zeile_23      = d.get('zeile_23_stock_losses_eur', abs(d.get('stocks_loss_eur', 0)))
+zeile_7       = d.get('zeile_7_kapitalertraege_mit_inlaendischem_steuerabzug_eur', 0)
+zeile_37      = d.get('zeile_37_kapitalertragsteuer_eur', 0)
+zeile_38      = d.get('zeile_38_solidaritaetszuschlag_eur', 0)
 quellensteuer = d.get('withholding_tax_eur', 0)
 
 # Zuflussprinzip data
@@ -967,10 +974,13 @@ final = {
     ),
     'topf_1': topf_1,
     'topf_2': adj_topf_2,
+    'zeile_7': zeile_7,
     'zeile_19': adj_zeile_19,
     'zeile_20': zeile_20,
     'zeile_22': zeile_22,
     'zeile_23': zeile_23,
+    'zeile_37': zeile_37,
+    'zeile_38': zeile_38,
     'quellensteuer': quellensteuer,
     'etf_net_taxable': (kap_inv.get('etf_net_taxable_eur', 0) + tageskurs_kapinv_corr) if (has_etf_data and invstg_aktiv) else 0,
     'etf_wht':         kap_inv.get('etf_wht_eur', 0)                                     if (has_etf_data and invstg_aktiv) else 0,
@@ -1828,12 +1838,20 @@ if csv_cats:
 
 section_title(f"Anlage KAP {steuerjahr} · Eintragungen")
 
-kap_rows_html = (
+kap_rows_html = ""
+if abs(zeile_7) > 0.01:
+    kap_rows_html += (
+        kap_row("Z. 7", "Kapitalerträge mit inländischem Steuerabzug", zeile_7, highlight=True)
+        + kap_row("Z. 37", "Kapitalertragsteuer", zeile_37)
+        + kap_row("Z. 38", "Solidaritätszuschlag", zeile_38)
+    )
+
+kap_rows_html += (
     kap_row("Z. 19", "Ausländische Kapitalerträge (Netto)", adj_zeile_19, highlight=True)
     + kap_row("Z. 20", "Davon: Aktiengewinne", zeile_20)
     + kap_row("Z. 22", "Verluste ohne Aktien", zeile_22, force_positive=True)
     + kap_row("Z. 23", "Aktienverluste", zeile_23, force_positive=True)
-    + kap_row("Z. 41", "Anrechenbare Quellensteuer", quellensteuer)
+    + kap_row("Z. 41", "Anrechenbare ausländische Quellensteuer", quellensteuer)
 )
 
 if has_etf_data and invstg_aktiv:
@@ -1855,16 +1873,19 @@ st.markdown(kap_rows_html, unsafe_allow_html=True)
 
 if n_accounts > 1:
     with st.expander(f"Aufschlüsselung nach Konten ({n_accounts} Konten)"):
-        acct_table = "| Konto | Topf 1 (Aktien) | Topf 2 (Sonstiges) | Z. 19 (Netto) | Z. 41 (QSt) |\n"
-        acct_table += "|-------|----------------:|-------------------:|--------------:|------------:|\n"
+        acct_table = "| Konto | Topf 1 (Aktien) | Topf 2 (Sonstiges) | Z. 7 | Z. 19 (Netto) | Z. 37 | Z. 38 | Z. 41 (QSt) |\n"
+        acct_table += "|-------|----------------:|-------------------:|-----:|--------------:|------:|------:|------------:|\n"
         for idx, (name, rep) in enumerate(zip(account_names, reports)):
             t1 = rep.get('topf_1_aktien_netto', 0)
             t2 = rep.get('topf_2_sonstiges_netto', 0)
+            z7 = rep.get('zeile_7_kapitalertraege_mit_inlaendischem_steuerabzug_eur', 0)
             z19 = rep.get('zeile_19_netto_eur', t1 + t2)
+            z37 = rep.get('zeile_37_kapitalertragsteuer_eur', 0)
+            z38 = rep.get('zeile_38_solidaritaetszuschlag_eur', 0)
             z41 = rep.get('withholding_tax_eur', 0)
             label = f"Konto {idx+1} ({name})"
-            acct_table += f"| {label} | {fmt_de(t1)} | {fmt_de(t2)} | {fmt_de(z19)} | {fmt_de(z41)} |\n"
-        acct_table += f"| **Gesamt** | **{fmt_de(topf_1)}** | **{fmt_de(adj_topf_2)}** | **{fmt_de(adj_zeile_19)}** | **{fmt_de(quellensteuer)}** |\n"
+            acct_table += f"| {label} | {fmt_de(t1)} | {fmt_de(t2)} | {fmt_de(z7)} | {fmt_de(z19)} | {fmt_de(z37)} | {fmt_de(z38)} | {fmt_de(z41)} |\n"
+        acct_table += f"| **Gesamt** | **{fmt_de(topf_1)}** | **{fmt_de(adj_topf_2)}** | **{fmt_de(zeile_7)}** | **{fmt_de(adj_zeile_19)}** | **{fmt_de(zeile_37)}** | **{fmt_de(zeile_38)}** | **{fmt_de(quellensteuer)}** |\n"
         st.markdown(acct_table)
         st.info("Jedes Konto wurde vollständig separat berechnet (eigene Trades, Dividenden, FX-Berechnung, "
                 "Stillhalter-Erkennung). Die Einzelergebnisse wurden anschließend addiert.")
@@ -1998,6 +2019,7 @@ Bei **beiden** Assignment-Typen gilt laut BMF: „Die vereinnahmte Optionsprämi
 ### Dividenden & Payment in Lieu (PIL)
 
 - **Dividenden** (DIV): Laufende Erträge in Topf 2
+- **Deutsche Dividenden mit `- DE Steuer`**: werden separat als Kapitalerträge mit inländischem Steuerabzug behandelt (Zeile 7), nicht als ausländische Kapitalerträge in Zeile 19
 - **Payment in Lieu** (PIL): Ersatzzahlung wenn Aktien verliehen sind  - wird steuerlich wie eine Dividende behandelt und mit diesen zusammen verrechnet
 
 ---
@@ -2011,20 +2033,22 @@ Bei **beiden** Assignment-Typen gilt laut BMF: „Die vereinnahmte Optionsprämi
 
 ### Quellensteuer (Zeile 41)
 
-Ausländische Quellensteuern auf Dividenden und Zinsen (z.B. 15% US-Quellensteuer) werden in Zeile 41 als **anrechenbare ausländische Steuern** gemeldet. Das Finanzamt rechnet diese nach der Verlustverrechnung auf die deutsche Abgeltungsteuer an.
+Ausländische Quellensteuern auf Dividenden und Zinsen (z.B. 15% US-Quellensteuer) werden in Zeile 41 als **anrechenbare ausländische Steuern** gemeldet. Deutsche Dividendensteuer aus Buchungen mit `- DE Steuer` wird dagegen in Kapitalertragsteuer (Zeile 37) und Solidaritätszuschlag (Zeile 38) aufgeteilt.
 
 ---
 
 ### Zeilen-Zuordnung Anlage KAP
 
-Da Interactive Brokers ein **ausländischer Broker ohne inländischen Steuerabzug** ist, werden die Einkünfte in der Sektion „Kapitalerträge, die **nicht** dem inländischen Steuerabzug unterlegen haben" (Zeilen 18–23) eingetragen:
+Da Interactive Brokers ein **ausländischer Broker ohne inländischen Steuerabzug** ist, werden die meisten Einkünfte in der Sektion „Kapitalerträge, die **nicht** dem inländischen Steuerabzug unterlegen haben" (Zeilen 18–23) eingetragen. Ausnahme: deutsche Dividenden mit separat gebuchter `- DE Steuer`.
 
 | Zeile | Bedeutung | Berechnung |
 |-------|-----------|------------|
+| **7** | Kapitalerträge mit inländischem Steuerabzug | DE-Dividenden mit passender `- DE Steuer`-Buchung |
 | **19** | Ausländische Kapitalerträge (Netto) | Topf 1 + Topf 2 (Summe aller Erträge und Verluste) |
 | **20** | Davon: Aktiengewinne | Brutto-Aktiengewinne (ohne Verluste) |
 | **22** | Verluste ohne Aktien | Verluste aus Optionen, Futures, Anleihen etc. (positiver Betrag) |
 | **23** | Aktienverluste | Verluste aus Aktienveräußerungen (positiver Betrag) |
+| **37/38** | Kapitalertragsteuer / Soli | Aufteilung deutscher Dividendensteuer (25% + 5,5% Soli) |
 | **41** | Anrechenbare Quellensteuer | Summe aller ausländischen Quellensteuern |
 
 ---
@@ -2316,11 +2340,12 @@ TOPF 2: SONSTIGES (inkl. Termingeschäfte)
 {topf2_detail_export}{fx_export}{sh_export}{inv_export}
 ═══════════════════════════════════════════════════
 ANLAGE KAP EINTRAGUNGEN
+{"" if abs(final['zeile_7']) <= 0.01 else f"  Zeile 7 (inländischer Steuerabzug): {fmt_de(final['zeile_7']):>7} EUR" + chr(10) + f"  Zeile 37 (Kapitalertragsteuer): {fmt_de(final['zeile_37']):>10} EUR" + chr(10) + f"  Zeile 38 (Solidaritätszuschlag): {fmt_de(final['zeile_38']):>9} EUR" + chr(10)}
   Zeile 19 (Netto):      {fmt_de(final['zeile_19']):>14} EUR
   Zeile 20 (Aktiengewinne): {fmt_de(final['zeile_20']):>11} EUR
   Zeile 22 (Verluste o. Aktien): {fmt_de(final['zeile_22']):>8} EUR
   Zeile 23 (Aktienverluste): {fmt_de(final['zeile_23']):>11} EUR
-  Zeile 41 (Quellensteuer): {fmt_de(final['quellensteuer']):>11} EUR
+  Zeile 41 (ausl. Quellensteuer): {fmt_de(final['quellensteuer']):>8} EUR
 {"" if not (has_etf_data and invstg_aktiv) else chr(10) + "ANLAGE KAP-INV EINTRAGUNGEN" + chr(10) + f"  KAP-INV Erträge (nach TFS): {fmt_de(final['etf_net_taxable']):>8} EUR" + chr(10) + f"  KAP-INV Quellensteuer: {fmt_de(final['etf_wht']):>13} EUR" + chr(10)}{"" if not has_so_data else chr(10) + "ANLAGE SO (§23 EStG) — PRIVATE VERÄUSSERUNGSGESCHÄFTE" + chr(10) + f"  Physische Gold-ETCs (BFH VIII R 4/15)" + chr(10) + f"  Steuerpflichtig (≤ 1J): {fmt_de(so_taxable_for_row):>12} EUR  → Anlage SO" + chr(10) + f"  Steuerfrei (> 1J):      {fmt_de(so_free_for_row):>12} EUR" + chr(10)}═══════════════════════════════════════════════════
 """
 

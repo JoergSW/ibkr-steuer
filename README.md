@@ -41,7 +41,7 @@ cd ibkr-steuer
 python3 -m venv .venv
 source .venv/bin/activate
 pip install streamlit
-streamlit run gui_app/app.py
+streamlit run app.py
 ```
 
 ## Steuerliche Grundlagen

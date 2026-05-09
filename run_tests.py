@@ -29,7 +29,7 @@ FIELDS = ['zeile_19', 'zeile_20', 'zeile_22', 'zeile_23', 'zeile_41', 'etf_net_t
 def compute_user_facing(rd):
     """Repliziert das GUI-final-Dict mit allen Default-Toggles aktiv (Tageskurs,
     InvStG, Zuflussprinzip). Die Werte entsprechen dem, was der User sieht.
-    Logik gespiegelt aus gui_app/app.py:825-977."""
+    Logik gespiegelt aus app.py."""
     pre_z19 = rd.get('zeile_19_netto_eur', 0)
     pre_z20 = rd.get('zeile_20_stock_gains_eur', 0)
     pre_z22 = rd.get('zeile_22_other_losses_eur', 0)
@@ -45,7 +45,7 @@ def compute_user_facing(rd):
     stillhalter_details = audit.get('stillhalter_details', []) or []
 
     # Zuflussprinzip default-on, aber nur sichtbar wenn cross_year_details
-    # vorhanden (gui_app/app.py:828, 841). Die GUI zieht audit['cross_year_premium_eur']
+    # vorhanden. Die GUI zieht audit['cross_year_premium_eur']
     # ab; genau diesen Wert verwenden wir hier, damit ein falsch aggregiertes
     # Audit-Feld (z.B. prior_zufluss doppelt enthalten) im Test sichtbar wird.
     cross_year_details = [d for d in stillhalter_details if d.get('is_cross_year')]
@@ -54,7 +54,7 @@ def compute_user_facing(rd):
     adj_cross = cross_year_premium if has_cross_year_details else 0
 
     # Tageskurs-Toggle wird in der GUI nur gezeigt wenn |fx_corr_total| > 0.01
-    # (gui_app/app.py:903). Wenn nicht gezeigt → tageskurs_aktiv=False → keine
+    # Wenn nicht gezeigt → tageskurs_aktiv=False → keine
     # Korrekturen anwenden. Verhindert dass sich aufhebende Topf1/Topf2-Korrekturen
     # den Test-Vergleich verfaelschen.
     tageskurs_aktiv = abs(fx_corr_total) > 0.01

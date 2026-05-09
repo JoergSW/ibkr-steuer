@@ -677,7 +677,7 @@ if len(accounts) > 1:
 if accounts_skipped:
     st.markdown(f"""
 <div style="background: rgba(251,191,36,0.06); border: 1px solid rgba(251,191,36,0.2); border-radius: 10px; padding: 0.6rem 1rem; margin-bottom: 1rem; font-size: 0.78rem; color: #94a3b8;">
-    <strong style="color: #fbbf24;">Übersprungen:</strong> {', '.join(accounts_skipped)} -- keine Daten für Steuerjahr {global_tax_year} vorhanden.
+    <strong style="color: #fbbf24;">Übersprungen:</strong> {', '.join(accounts_skipped)} — keine Daten für Steuerjahr {global_tax_year} vorhanden.
 </div>
 """, unsafe_allow_html=True)
 
@@ -688,7 +688,7 @@ for acct_id, xmls in accounts_to_process.items():
         acct_label = xmls[-1]['account_name'] or acct_id
         st.markdown(f"""
 <div style="background: rgba(16,185,129,0.08); border: 1px solid rgba(16,185,129,0.25); border-radius: 10px; padding: 0.6rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
-    <strong style="color: #34d399;">{len(xmls)} Quartals-XMLs erkannt</strong> ({', '.join(periods)}) fur {acct_label} -- werden zu einem Jahresreport {global_tax_year} zusammengefuhrt.
+    <strong style="color: #34d399;">{len(xmls)} Quartals-XMLs erkannt</strong> ({', '.join(periods)}) für {acct_label} — werden zu einem Jahresreport {global_tax_year} zusammengeführt.
 </div>
 """, unsafe_allow_html=True)
 
@@ -1405,7 +1405,7 @@ if trade_details and tageskurs_aktiv:
         trade_details.append({
             'dateTime': close_dt, 'reportDate': close_dt,
             'symbol': lot.get('symbol', ''),
-            'description': f'Tageskurs-Korrektur (Kauf {open_dt}, Kurs {lot["fx_open"]:.5f} -> {lot["fx_close"]:.5f})',
+            'description': f'Tageskurs-Korrektur (Kauf {open_dt}, Kurs {lot["fx_open"]:.5f} → {lot["fx_close"]:.5f})',
             'isin': lot.get('isin', ''), 'assetCategory': lot.get('assetCategory', ''),
             'subCategory': lot.get('subCategory', ''), 'buySell': '', 'openClose': '',
             'quantity': lot.get('quantity', ''), 'transactionType': 'FX-Korrektur',
@@ -1422,8 +1422,10 @@ if trade_details:
 
     from collections import defaultdict
     topf_readable = {
-        'Topf1': 'Topf 1 - Aktien', 'Topf2': 'Topf 2 - Sonstiges',
-        'KAP-INV': 'Anlage KAP-INV (InvStG)', 'Anlage SO': 'Anlage SO',
+        'Topf1': 'Topf 1 - Aktien (§20 Abs. 2 Nr. 1 EStG)',
+        'Topf2': 'Topf 2 - Sonstiges (Termingeschäfte, Stillhalter, FX)',
+        'KAP-INV': 'Anlage KAP-INV (InvStG)',
+        'Anlage SO': 'Anlage SO (§23 EStG)',
     }
     cat_labels = {
         'STK': 'Aktie', 'OPT': 'Option', 'FUT': 'Future',
@@ -1450,7 +1452,7 @@ if trade_details:
             s = sum(r.get('pnl_eur', 0) for r in rows)
             summary_lines.append(f"{topf_readable.get(topf_key, topf_key).split(' - ')[0]}: {fmt_de(s)} EUR")
     st.markdown(" | ".join(summary_lines))
-    st.caption("Enthaelt Trades, Optionsverlaeufe, Stillhalter-Korrekturen und Zufluesse. Dividenden, Zinsen und Quellensteuer sind nicht enthalten.")
+    st.caption("Enthält Trades, Optionsverläufe, Stillhalter-Korrekturen und Zuflüsse. Dividenden, Zinsen und Quellensteuer sind nicht enthalten (siehe IBKR-Kontoauszug).")
 
     def _format_instrument(row):
         sym = row.get('symbol', '') or ''; desc = row.get('description', '') or ''
@@ -1526,12 +1528,12 @@ if trade_details:
                     anmerkung = ''
                     if source == 'pnl_summary': anmerkung = 'Aus IBKR PnL-Summary'
                     elif source == 'stillhalter_korrektur': anmerkung = r.get('description', 'Korrektur')
-                    elif source == 'zufluss': anmerkung = r.get('description', 'Zufluss')
+                    elif source == 'zufluss': anmerkung = r.get('description', 'Zufluss §11 EStG')
                     elif source == 'zufluss_korrektur': anmerkung = r.get('description', 'Vorjahres-Korrektur')
                     elif source == 'tageskurs_korrektur': anmerkung = r.get('description', 'Tageskurs')
                     elif source == 'cross_year_put_korrektur': anmerkung = r.get('description', 'Cross-Year Put-Korrektur')
                     elif source == 'trades' and r.get('stillhalter_adjusted'):
-                        anmerkung = 'Korrigiert: Praemie separiert (s. Stillhalterpraemie Topf 2)'
+                        anmerkung = 'Korrigiert: Prämie separiert (s. Stillhalterprämie Topf 2)'
                     bs = r.get('buySell', ''); oc = r.get('openClose', '')
                     if bs == 'SELL' and oc == 'O': bs_label = 'STO'
                     elif bs == 'BUY' and oc == 'C': bs_label = 'BTC'

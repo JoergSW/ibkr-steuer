@@ -1342,13 +1342,15 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                   and (d := parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))) is not None
                   and d.year == tax_year]
 
-    # Group by instrument key to match sells against closes/assignments
+    # Group by full option series. underlyingSymbol is required because
+    # different underlyings can share strike/expiry/putCall.
     from collections import defaultdict
     instr_sells = defaultdict(list)   # {key: [sell_trades]}
     instr_closes = defaultdict(int)   # {key: total_closed_qty}
 
     for t in sell_opens:
-        key = (t.get('assetCategory'), t.get('strike'), t.get('expiry'), t.get('putCall'))
+        key = (t.get('assetCategory'), t.get('underlyingSymbol', ''),
+               t.get('strike'), t.get('expiry'), t.get('putCall'))
         instr_sells[key].append(t)
 
     # Count closing BUYs (Glattstellungen) and BookTrades (Assignments) in tax_year
@@ -1358,7 +1360,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         rd = parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))
         if not rd or rd.year != tax_year:
             continue
-        key = (t.get('assetCategory'), t.get('strike'), t.get('expiry'), t.get('putCall'))
+        key = (t.get('assetCategory'), t.get('underlyingSymbol', ''),
+               t.get('strike'), t.get('expiry'), t.get('putCall'))
         if key not in instr_sells:
             continue
         # Closing BUY (Glattstellung) — has PnL ≠ 0
@@ -1440,14 +1443,15 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             if sd and (sell_date is None or sd < sell_date):
                 sell_date = sd
 
-        symbol = sells_sorted[0].get('symbol') or sells_sorted[0].get('description') or f"{key[1]} {key[2]} {key[3]}"
+        symbol = sells_sorted[0].get('symbol') or sells_sorted[0].get('description') or f"{key[1]} {key[2]} {key[3]} {key[4]}"
         currency = sells_sorted[0].get('currency', '')
         avg_price = total_premium_raw / (total_open_qty * mult) if (total_open_qty and mult) else 0
         zufluss_details.append({
             'symbol': symbol,
-            'strike': key[1],
-            'expiry': key[2],
-            'putCall': key[3],
+            'underlyingSymbol': key[1],
+            'strike': key[2],
+            'expiry': key[3],
+            'putCall': key[4],
             'quantity': total_open_qty,
             'premium_eur': premium_eur,
             'premium_raw': net_premium_raw,
@@ -1470,7 +1474,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         # Add zufluss premiums to trade details
         for det in zufluss_details:
             pc_label = 'Call' if det['putCall'] == 'C' else 'Put'
-            underlying = det['symbol'].split()[0] if det['symbol'] else ''
+            underlying = det.get('underlyingSymbol') or (det['symbol'].split()[0] if det['symbol'] else '')
             debug_rows.append({
                 'dateTime': det.get('sell_date', ''), 'reportDate': det.get('sell_date', ''),
                 'symbol': det['symbol'],
@@ -1516,7 +1520,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         rd = parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))
         if not rd or rd.year >= tax_year:
             continue
-        key = (t.get('assetCategory'), t.get('strike'), t.get('expiry'), t.get('putCall'))
+        key = (t.get('assetCategory'), t.get('underlyingSymbol', ''),
+               t.get('strike'), t.get('expiry'), t.get('putCall'))
         prior_sell_opens[key].append(t)
 
     if prior_sell_opens:
@@ -1530,7 +1535,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             for t in trades:
                 if t.get('assetCategory') != key[0]:
                     continue
-                if t.get('strike') != key[1] or t.get('expiry') != key[2] or t.get('putCall') != key[3]:
+                if t.get('underlyingSymbol', '') != key[1]:
+                    continue
+                if t.get('strike') != key[2] or t.get('expiry') != key[3] or t.get('putCall') != key[4]:
                     continue
                 rd = parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))
                 if not rd or rd.year != tax_year:
@@ -1602,14 +1609,15 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             fx_to_base = fx_weighted / consumed_qty if consumed_qty else 1.0  # nur Display
 
             prior_zufluss_correction_eur += correction_eur
-            symbol = prior_sorted[0].get('symbol') or prior_sorted[0].get('description') or f"{key[1]} {key[2]} {key[3]}"
+            symbol = prior_sorted[0].get('symbol') or prior_sorted[0].get('description') or f"{key[1]} {key[2]} {key[3]} {key[4]}"
             currency = prior_sorted[0].get('currency', '')
             avg_price = total_premium_raw / (consumed_qty * mult) if (consumed_qty and mult) else 0
             prior_zufluss_details.append({
                 'symbol': symbol,
-                'strike': key[1],
-                'expiry': key[2],
-                'putCall': key[3],
+                'underlyingSymbol': key[1],
+                'strike': key[2],
+                'expiry': key[3],
+                'putCall': key[4],
                 'quantity': matched_qty,
                 'premium_eur': correction_eur,
                 'premium_raw': net_premium_raw,
@@ -1632,7 +1640,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
 
         for det in prior_zufluss_details:
             pc_label = 'Call' if det['putCall'] == 'C' else 'Put'
-            underlying = det['symbol'].split()[0] if det['symbol'] else ''
+            underlying = det.get('underlyingSymbol') or (det['symbol'].split()[0] if det['symbol'] else '')
             debug_rows.append({
                 'dateTime': det.get('sell_date', ''), 'reportDate': det.get('sell_date', ''),
                 'symbol': det['symbol'],
@@ -1673,16 +1681,22 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         rd = parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))
         if not rd or rd.year != tax_year:
             continue
-        key = (t.get('assetCategory'), t.get('strike'), t.get('expiry'), t.get('putCall'))
+        key = (t.get('assetCategory'), t.get('underlyingSymbol', ''),
+               t.get('strike'), t.get('expiry'), t.get('putCall'))
         if key not in all_sell_open_keys:
-            symbol = t.get('symbol') or t.get('description') or f"{key[1]} {key[2]} {key[3]}"
+            symbol = t.get('symbol') or t.get('description') or f"{key[1]} {key[2]} {key[3]} {key[4]}"
             # Avoid duplicate warnings for same instrument
-            if not any(u['strike'] == key[1] and u['expiry'] == key[2] and u['putCall'] == key[3] for u in zufluss_unmatched):
+            if not any(u.get('underlyingSymbol', '') == key[1]
+                       and u['strike'] == key[2]
+                       and u['expiry'] == key[3]
+                       and u['putCall'] == key[4]
+                       for u in zufluss_unmatched):
                 zufluss_unmatched.append({
                     'symbol': symbol,
-                    'strike': key[1],
-                    'expiry': key[2],
-                    'putCall': key[3],
+                    'underlyingSymbol': key[1],
+                    'strike': key[2],
+                    'expiry': key[3],
+                    'putCall': key[4],
                     'quantity': abs(int(safe_float(t.get('quantity')))),
                 })
 

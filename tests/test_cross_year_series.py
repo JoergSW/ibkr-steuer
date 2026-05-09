@@ -1,4 +1,4 @@
-"""Synthetischer Regression-Test fuer GH Issues #61 und #62.
+"""Synthetische Regression-Tests fuer GH Issues #56, #61 und #62.
 
 Cross-Year-Same-Series-FIFO-Konflikt: Wenn dieselbe Option-Series sowohl im
 Vorjahr als auch im Steuerjahr angedient wurde, hat der Same-Year-Block frueher
@@ -13,6 +13,10 @@ Aufruf: python tests/test_cross_year_series.py
 """
 import os
 import sys
+import contextlib
+import csv
+import io
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -20,6 +24,7 @@ from calculate_tax_report import (
     _build_stillhalter_details_for_assignment,
     _consume_open_sells_fifo,
     _get_open_option_sells,
+    calculate_tax,
     safe_float,
 )
 
@@ -72,6 +77,47 @@ def make_assignment(date, qty, strike="100", expiry="2024-12-20", pc="P",
         "reportDate": date,
         "fifoPnlRealized": "0",
     }
+
+
+def make_buy_close(date, qty, price, pnl, strike="100", expiry="2024-12-20",
+                   pc="P", underlying="TEST", a_cat="OPT", multiplier="100"):
+    return {
+        "tradeID": f"close_{underlying}_{date}_{qty}_{price}",
+        "assetCategory": a_cat,
+        "transactionType": "ExchTrade",
+        "buySell": "BUY",
+        "putCall": pc,
+        "strike": strike,
+        "expiry": expiry,
+        "underlyingSymbol": underlying,
+        "symbol": f"{underlying} {strike} {expiry} {pc}",
+        "quantity": str(qty),
+        "tradePrice": str(price),
+        "closePrice": str(price),
+        "multiplier": multiplier,
+        "ibCommission": "0",
+        "fxRateToBase": "1.0",
+        "currency": "USD",
+        "dateTime": f"{date} 10:00:00",
+        "tradeDate": date,
+        "reportDate": date,
+        "fifoPnlRealized": str(pnl),
+    }
+
+
+def calculate_for_trades(trades, tax_year=2022):
+    fieldnames = sorted({k for row in trades for k in row})
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "account_info.csv"), "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["currency", "tax_year", "fx_transactions_count"])
+            writer.writeheader()
+            writer.writerow({"currency": "EUR", "tax_year": str(tax_year), "fx_transactions_count": "0"})
+        with open(os.path.join(tmp, "trades.csv"), "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(trades)
+        with contextlib.redirect_stdout(io.StringIO()):
+            return calculate_tax(tmp)
 
 
 def simulate_pre_consume(trades, series_key, tax_year, base_currency="EUR",
@@ -269,9 +315,53 @@ def test_mixed_year_assignment_splits_cross_year_premium():
     print(f"    Cross-Year-Praemie = {cross_year_premium:.2f} EUR, Gesamt = {detail_total:.2f} EUR")
 
 
+def test_issue_56_prior_year_correction_uses_underlying():
+    """TC5: Vorjahres-Zufluss darf gleichartige Serien anderer Underlyings nicht konsumieren."""
+    trades = [
+        make_sell("2021-12-01", 2, 19.90, strike="155", expiry="2022-01-21", underlying="GPN"),
+        make_sell("2021-12-03", 1, 3.20, strike="155", expiry="2022-01-21", underlying="SQ"),
+        make_buy_close("2022-01-05", 1, 11.65, -847, strike="155", expiry="2022-01-21", underlying="SQ"),
+    ]
+    rd = calculate_for_trades(trades, tax_year=2022)
+    audit = rd.get("audit", {})
+
+    assert_close(audit.get("prior_zufluss_correction_eur", 0), 319.0,
+                 label="TC5 prior_zufluss_correction_eur")
+    details = audit.get("prior_zufluss_details", [])
+    assert len(details) == 1, f"erwartet 1 Vorjahres-Korrektur, aktuell {len(details)}"
+    assert details[0].get("underlyingSymbol") == "SQ", \
+        f"erwartet SQ-Korrektur, aktuell {details[0].get('underlyingSymbol')}"
+
+    print("  TC5 Issue #56 Vorjahres-Korrektur nach Underlying: OK")
+    print(f"    Korrektur = {audit.get('prior_zufluss_correction_eur', 0):.2f} EUR (SQ, nicht GPN)")
+
+
+def test_issue_56_current_year_zufluss_uses_underlying():
+    """TC6: Current-year Zufluss muss offene Fills pro Underlying bestimmen."""
+    trades = [
+        make_sell("2022-01-01", 1, 10.00, strike="155", expiry="2022-01-21", underlying="GPN"),
+        make_sell("2022-01-02", 1, 2.00, strike="155", expiry="2022-01-21", underlying="SQ"),
+        make_buy_close("2022-01-03", 1, 5.00, -300, strike="155", expiry="2022-01-21", underlying="SQ"),
+    ]
+    rd = calculate_for_trades(trades, tax_year=2022)
+    audit = rd.get("audit", {})
+
+    assert_close(audit.get("zufluss_premium_eur", 0), 999.0,
+                 label="TC6 zufluss_premium_eur")
+    details = audit.get("zufluss_details", [])
+    assert len(details) == 1, f"erwartet 1 offene Zufluss-Position, aktuell {len(details)}"
+    assert details[0].get("underlyingSymbol") == "GPN", \
+        f"erwartet GPN-Zufluss, aktuell {details[0].get('underlyingSymbol')}"
+
+    print("  TC6 Issue #56 Current-Year-Zufluss nach Underlying: OK")
+    print(f"    Zufluss = {audit.get('zufluss_premium_eur', 0):.2f} EUR (GPN offen, SQ geschlossen)")
+
+
 if __name__ == "__main__":
     test_cross_year_put_series()
     test_cross_year_call_series()
     test_steueryahr_only_no_op()
     test_mixed_year_assignment_splits_cross_year_premium()
-    print("\nOK: alle 4 TCs gruen")
+    test_issue_56_prior_year_correction_uses_underlying()
+    test_issue_56_current_year_zufluss_uses_underlying()
+    print("\nOK: alle 6 TCs gruen")

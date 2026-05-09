@@ -929,12 +929,16 @@ if abs(fx_corr_total) > 0.01:
             adj_zeile_19 += corr_topf1 + corr_topf2
             zeile_19 += corr_topf1 + corr_topf2
         else:
+            topf_1 += tageskurs_kapinv_corr
             adj_zeile_19 += fx_corr_total
             zeile_19 += fx_corr_total
         # Zeilen 20/22/23 per-Lot gain/loss adjustments
         zeile_20 += tk_gain_adj.get('Topf1', 0)
         zeile_23 -= tk_loss_adj.get('Topf1', 0)
         zeile_22 -= tk_loss_adj.get('Topf2', 0)
+        if not invstg_aktiv:
+            zeile_20 += tk_gain_adj.get('KAP-INV', 0)
+            zeile_23 -= tk_loss_adj.get('KAP-INV', 0)
     else:
         tageskurs_kapinv_corr = 0
 
@@ -946,11 +950,13 @@ final = {
     'stocks_gain': (
         d.get('stocks_gain_eur', 0)
         + (tk_gain_adj.get('Topf1', 0) if tageskurs_aktiv else 0)
+        + (tk_gain_adj.get('KAP-INV', 0) if (tageskurs_aktiv and _etf_reintegrate) else 0)
         + (max(kap_inv.get('etf_gain_raw_eur', 0), 0) if _etf_reintegrate else 0)
     ),
     'stocks_loss': (
         d.get('stocks_loss_eur', 0)
         + (tk_loss_adj.get('Topf1', 0) if tageskurs_aktiv else 0)
+        + (tk_loss_adj.get('KAP-INV', 0) if (tageskurs_aktiv and _etf_reintegrate) else 0)
         + (min(kap_inv.get('etf_loss_raw_eur', 0), 0) if _etf_reintegrate else 0)
     ),
     'dividends': (
@@ -1443,9 +1449,15 @@ if d:
         (r.get('underlyingSymbol', '') or r.get('symbol', '') or '?').split()[0]
         for r in trade_details if r.get('source') == 'trades'
     ))
-    header = f"**{n_trades} Trades, {n_underlyings} Wertpapiere"
-    if n_korr > 0: header += f" (+ {n_korr} Korrekturen/Zufluesse)"
-    header += "**"
+    if n_trades > 0:
+        header = f"**{n_trades} Trades, {n_underlyings} Wertpapiere"
+        if n_korr > 0:
+            header += f" (+ {n_korr} Korrekturen/Zuflüsse)"
+        header += "**"
+    elif n_korr > 0:
+        header = f"**Keine Trades, {n_korr} Korrektur-/Zuflusspositionen**"
+    else:
+        header = "**Keine Trade-Details - Zusammenfassung verfügbar**"
     summary_lines = [header]
     for topf_key in ['Topf1', 'Topf2', 'KAP-INV', 'Anlage SO']:
         rows = trades_by_topf.get(topf_key, [])
@@ -1499,6 +1511,13 @@ if d:
             key: sum(float(r.get('pnl_eur') or 0) for r in rows)
             for key, rows in trades_by_topf.items()
         }
+        trade_topf1_reconciled = trade_sums.get('Topf1', 0)
+        trade_topf2_reconciled = trade_sums.get('Topf2', 0)
+        kap_inv_trade_total = trade_sums.get('KAP-INV', 0)
+        kap_inv_reintegration_note = ""
+        if export_context['has_etf_data'] and not export_context['invstg_aktiv'] and abs(kap_inv_trade_total) > 0.005:
+            trade_topf1_reconciled += kap_inv_trade_total
+            kap_inv_reintegration_note = "KAP-INV-Detailwerte wurden wegen deaktivierter InvStG-Klassifizierung in Topf 1 reintegriert."
 
         summary_cols = ["Bereich", "Position", "Wert EUR", "Hinweis"]
         for i, width in enumerate([22, 44, 16, 60], 1):
@@ -1511,7 +1530,7 @@ if d:
         row_num = 2
         meta_rows = [
             ("Erstellt", export_context['created_at']),
-            ("Basiswaehrung", export_context['base_currency']),
+            ("Basiswährung", export_context['base_currency']),
             ("Quelle", "final (GUI/Textreport Single Source of Truth)"),
         ]
         for label, value in meta_rows:
@@ -1533,18 +1552,18 @@ if d:
             ("Topf 2", "Sonstige Gewinne", f['options_gain'], ""),
             ("Topf 2", "Sonstige Verluste", f['options_loss'], ""),
             ("Topf 2", "Saldo Sonstiges", f['topf_2'], ""),
-            ("Anlage KAP", "Zeile 7 - inlaendischer Steuerabzug", f['zeile_7'], ""),
-            ("Anlage KAP", "Zeile 19 - auslaendische Kapitalertraege netto", f['zeile_19'], ""),
+            ("Anlage KAP", "Zeile 7 - inländischer Steuerabzug", f['zeile_7'], ""),
+            ("Anlage KAP", "Zeile 19 - ausländische Kapitalerträge netto", f['zeile_19'], ""),
             ("Anlage KAP", "Zeile 20 - Aktiengewinne", f['zeile_20'], ""),
             ("Anlage KAP", "Zeile 22 - Verluste ohne Aktien", f['zeile_22'], "positiver Eintrag"),
             ("Anlage KAP", "Zeile 23 - Aktienverluste", f['zeile_23'], "positiver Eintrag"),
             ("Anlage KAP", "Zeile 37 - Kapitalertragsteuer", f['zeile_37'], ""),
-            ("Anlage KAP", "Zeile 38 - Solidaritaetszuschlag", f['zeile_38'], ""),
+            ("Anlage KAP", "Zeile 38 - Solidaritätszuschlag", f['zeile_38'], ""),
             ("Anlage KAP", "Zeile 41 - ausl. Quellensteuer", f['quellensteuer'], ""),
         ]
         if has_etf:
             summary_rows.extend([
-                ("Anlage KAP-INV", "Ertraege nach Teilfreistellung", f['etf_net_taxable'], ""),
+                ("Anlage KAP-INV", "Erträge nach Teilfreistellung", f['etf_net_taxable'], ""),
                 ("Anlage KAP-INV", "Anrechenbare Quellensteuer ETF", f['etf_wht'], ""),
             ])
         if has_so:
@@ -1582,7 +1601,7 @@ if d:
                     elif val < -0.005:
                         cell.fill = loss_fill
                         cell.font = loss_font
-            if label.startswith("Saldo ") or label.startswith("Zeile 19") or label.startswith("Ertraege "):
+            if label.startswith("Saldo ") or label.startswith("Zeile 19") or label.startswith("Erträge "):
                 for ci in range(1, len(summary_cols) + 1):
                     ws.cell(row=row_num, column=ci).font = sub_font
                     ws.cell(row=row_num, column=ci).fill = sub_fill
@@ -1597,11 +1616,11 @@ if d:
         row_num += 1
         reconciliation_rows = [
             ("Topf 1", "Finaler Wert", f['topf_1'], "GUI/TXT/Excel-Summary"),
-            ("Topf 1", "Trade-Details", trade_sums.get('Topf1', 0), "Nachweis-Sheet"),
-            ("Topf 1", "Differenz", f['topf_1'] - trade_sums.get('Topf1', 0), "sollte 0 sein, sofern alle Aktien aus Trade-Details stammen"),
+            ("Topf 1", "Trade-Details", trade_topf1_reconciled, kap_inv_reintegration_note or "Nachweis-Sheet"),
+            ("Topf 1", "Differenz", f['topf_1'] - trade_topf1_reconciled, "Kontrollwert; Abweichungen können aus PnL-Summary-Fallbacks, Rundung oder Toggle-Reintegration stammen"),
             ("Topf 2", "Finaler Wert", f['topf_2'], "inkl. Dividenden, Zinsen, FX, Stillhalter"),
-            ("Topf 2", "Trade-Details", trade_sums.get('Topf2', 0), "Trades und Korrekturen"),
-            ("Topf 2", "Nicht-Trade-Anteil", f['topf_2'] - trade_sums.get('Topf2', 0), "Cash-Ertraege/Korrekturen, z.B. Dividenden und Zinsen"),
+            ("Topf 2", "Trade-Details", trade_topf2_reconciled, "Trades und Korrekturen"),
+            ("Topf 2", "Nicht-Trade-Anteil", f['topf_2'] - trade_topf2_reconciled, "Cash-Erträge/Korrekturen, z.B. Dividenden und Zinsen"),
             ("Anlage KAP", "Zeile 19 minus Topf 1 minus Topf 2", f['zeile_19'] - (f['topf_1'] + f['topf_2']), "sollte 0 sein"),
         ]
         for ci, cn in enumerate(summary_cols, 1):

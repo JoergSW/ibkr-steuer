@@ -980,6 +980,7 @@ final = {
     'etf_net_taxable': (kap_inv.get('etf_net_taxable_eur', 0) + tageskurs_kapinv_corr) if (has_etf_data and invstg_aktiv) else 0,
     'etf_wht':         kap_inv.get('etf_wht_eur', 0)                                     if (has_etf_data and invstg_aktiv) else 0,
 }
+created_at = _dt.now().strftime('%d.%m.%Y %H:%M')
 
 # ── Basiswährung ────────────────────────────────────────────────────────────
 
@@ -1027,13 +1028,13 @@ elif not xml_has_fx and fx_source == 'csv':
 
 # ── Hero ─────────────────────────────────────────────────────────────────────
 
-hero_color = "#4ade80" if adj_zeile_19 >= 0 else "#f87171"
+hero_color = "#4ade80" if final['zeile_19'] >= 0 else "#f87171"
 invstg_label = ""
 st.markdown(f"""
 <div class="hero-card">
     <div class="hero-label">Zeile 19 · Ausländische Kapitalerträge (Netto){"  · Zuflussprinzip" if zuflussprinzip_aktiv else ""}{invstg_label}</div>
-    <div class="hero-value" style="color:{hero_color}">{fmt(adj_zeile_19)}</div>
-    <div class="hero-formula">Topf 1 ({fmt(topf_1)}) + Topf 2 ({fmt(adj_topf_2)})</div>
+    <div class="hero-value" style="color:{hero_color}">{fmt(final['zeile_19'])}</div>
+    <div class="hero-formula">Topf 1 ({fmt(final['topf_1'])}) + Topf 2 ({fmt(final['topf_2'])})</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -1416,8 +1417,8 @@ if trade_details and tageskurs_aktiv:
             'underlyingSymbol': underlying, 'source': 'tageskurs_korrektur',
         })
     trade_details.sort(key=lambda r: r.get('dateTime', '') or r.get('reportDate', '') or 'zzzz')
-if trade_details:
-    section_title('Einzelnachweise - Trade-Details (Excel)')
+if d:
+    section_title('Export - Excel-Steuerreport')
     st.markdown('<div style="margin-top:-18px;margin-bottom:12px"><span style="background:linear-gradient(135deg,#f59e0b,#ef4444);color:#fff;padding:5px 16px;border-radius:6px;font-size:0.85em;font-weight:700;letter-spacing:1px;box-shadow:0 2px 8px rgba(239,68,68,0.3)">NEUE FUNKTION &middot; BETA</span></div>', unsafe_allow_html=True)
 
     from collections import defaultdict
@@ -1452,7 +1453,7 @@ if trade_details:
             s = sum(r.get('pnl_eur', 0) for r in rows)
             summary_lines.append(f"{topf_readable.get(topf_key, topf_key).split(' - ')[0]}: {fmt_de(s)} EUR")
     st.markdown(" | ".join(summary_lines))
-    st.caption("Enthält Trades, Optionsverläufe, Stillhalter-Korrekturen und Zuflüsse. Dividenden, Zinsen und Quellensteuer sind nicht enthalten (siehe IBKR-Kontoauszug).")
+    st.caption("Die Excel-Datei enthält zuerst die steuerliche Zusammenfassung aus denselben finalen Werten wie GUI und Textreport. Die Trade-Details dienen als Nachweis und werden separat abgestimmt.")
 
     def _format_instrument(row):
         sym = row.get('symbol', '') or ''; desc = row.get('description', '') or ''
@@ -1470,12 +1471,15 @@ if trade_details:
         sym = (row.get('symbol', '') or '').strip()
         return sym.split()[0] if sym else '?'
 
-    def _build_excel(trade_details, trades_by_topf):
+    def _build_excel(trade_details, trades_by_topf, export_context):
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
         from openpyxl.utils import get_column_letter
         import io
-        wb = Workbook(); ws = wb.active; ws.title = f"Trade-Details {steuerjahr}"
+        wb = Workbook()
+        ws_details = wb.active
+        ws_details.title = f"Trade-Details {steuerjahr}"
+        ws = wb.create_sheet("Zusammenfassung")
         hdr_font = Font(bold=True, color="FFFFFF", size=11); hdr_fill = PatternFill("solid", fgColor="1e3a5f")
         grp_font = Font(bold=True, size=10); grp_fill = PatternFill("solid", fgColor="d6e4f0")
         gain_font = Font(color="006100", size=9); gain_fill = PatternFill("solid", fgColor="e2efda")
@@ -1484,7 +1488,151 @@ if trade_details:
         sub_font = Font(bold=True, size=9); sub_fill = PatternFill("solid", fgColor="f2f2f2")
         total_font = Font(bold=True, size=10, color="FFFFFF"); total_fill = PatternFill("solid", fgColor="4a4a4a")
         normal_font = Font(size=9); thin_border = Border(bottom=Side(style='thin', color='cccccc'))
-        num_fmt_eur = '#.##0,00'; num_fmt_4d = '#.##0,0000'
+        num_fmt_eur = '#,##0.00'; num_fmt_4d = '#,##0.0000'
+
+        f = export_context['final']
+        has_etf = export_context['has_etf_data'] and export_context['invstg_aktiv']
+        has_so = export_context['has_so_data']
+        so_taxable = export_context['so_taxable']
+        so_free = export_context['so_free']
+        trade_sums = {
+            key: sum(float(r.get('pnl_eur') or 0) for r in rows)
+            for key, rows in trades_by_topf.items()
+        }
+
+        summary_cols = ["Bereich", "Position", "Wert EUR", "Hinweis"]
+        for i, width in enumerate([22, 44, 16, 60], 1):
+            ws.column_dimensions[get_column_letter(i)].width = width
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(summary_cols))
+        cell = ws.cell(row=1, column=1, value=f"ANLAGE KAP {steuerjahr} - Steuerbericht")
+        cell.font = hdr_font
+        cell.fill = hdr_fill
+        cell.alignment = Alignment(horizontal='left')
+        row_num = 2
+        meta_rows = [
+            ("Erstellt", export_context['created_at']),
+            ("Basiswaehrung", export_context['base_currency']),
+            ("Quelle", "final (GUI/Textreport Single Source of Truth)"),
+        ]
+        for label, value in meta_rows:
+            ws.cell(row=row_num, column=1, value=label)
+            ws.cell(row=row_num, column=2, value=value)
+            for ci in range(1, len(summary_cols) + 1):
+                cell = ws.cell(row=row_num, column=ci)
+                cell.font = normal_font
+                cell.border = thin_border
+            ws.cell(row=row_num, column=1).font = sub_font
+            row_num += 1
+
+        summary_rows = [
+            ("Topf 1", "Aktiengewinne", f['stocks_gain'], ""),
+            ("Topf 1", "Aktienverluste", f['stocks_loss'], ""),
+            ("Topf 1", "Saldo Aktien", f['topf_1'], ""),
+            ("Topf 2", "Dividenden", f['dividends'], ""),
+            ("Topf 2", "Zinsen netto", f['interest'], ""),
+            ("Topf 2", "Sonstige Gewinne", f['options_gain'], ""),
+            ("Topf 2", "Sonstige Verluste", f['options_loss'], ""),
+            ("Topf 2", "Saldo Sonstiges", f['topf_2'], ""),
+            ("Anlage KAP", "Zeile 7 - inlaendischer Steuerabzug", f['zeile_7'], ""),
+            ("Anlage KAP", "Zeile 19 - auslaendische Kapitalertraege netto", f['zeile_19'], ""),
+            ("Anlage KAP", "Zeile 20 - Aktiengewinne", f['zeile_20'], ""),
+            ("Anlage KAP", "Zeile 22 - Verluste ohne Aktien", f['zeile_22'], "positiver Eintrag"),
+            ("Anlage KAP", "Zeile 23 - Aktienverluste", f['zeile_23'], "positiver Eintrag"),
+            ("Anlage KAP", "Zeile 37 - Kapitalertragsteuer", f['zeile_37'], ""),
+            ("Anlage KAP", "Zeile 38 - Solidaritaetszuschlag", f['zeile_38'], ""),
+            ("Anlage KAP", "Zeile 41 - ausl. Quellensteuer", f['quellensteuer'], ""),
+        ]
+        if has_etf:
+            summary_rows.extend([
+                ("Anlage KAP-INV", "Ertraege nach Teilfreistellung", f['etf_net_taxable'], ""),
+                ("Anlage KAP-INV", "Anrechenbare Quellensteuer ETF", f['etf_wht'], ""),
+            ])
+        if has_so:
+            summary_rows.extend([
+                ("Anlage SO", "Steuerpflichtig <= 1 Jahr", so_taxable, ""),
+                ("Anlage SO", "Steuerfrei > 1 Jahr", so_free, "nicht in Anlage KAP"),
+            ])
+
+        row_num += 1
+        for ci, cn in enumerate(summary_cols, 1):
+            cell = ws.cell(row=row_num, column=ci, value=cn)
+            cell.font = Font(bold=True, size=9)
+            cell.fill = PatternFill("solid", fgColor="e8e8e8")
+            cell.border = thin_border
+        row_num += 1
+        current_area = None
+        for area, label, value, note in summary_rows:
+            if area != current_area:
+                current_area = area
+                ws.merge_cells(start_row=row_num, start_column=1, end_row=row_num, end_column=len(summary_cols))
+                cell = ws.cell(row=row_num, column=1, value=area)
+                cell.font = grp_font
+                cell.fill = grp_fill
+                row_num += 1
+            values = [area, label, value, note]
+            for ci, val in enumerate(values, 1):
+                cell = ws.cell(row=row_num, column=ci, value=val)
+                cell.font = normal_font
+                cell.border = thin_border
+                if ci == 3 and isinstance(val, (int, float)):
+                    cell.number_format = num_fmt_eur
+                    if val > 0.005:
+                        cell.fill = gain_fill
+                        cell.font = gain_font
+                    elif val < -0.005:
+                        cell.fill = loss_fill
+                        cell.font = loss_font
+            if label.startswith("Saldo ") or label.startswith("Zeile 19") or label.startswith("Ertraege "):
+                for ci in range(1, len(summary_cols) + 1):
+                    ws.cell(row=row_num, column=ci).font = sub_font
+                    ws.cell(row=row_num, column=ci).fill = sub_fill
+            row_num += 1
+
+        row_num += 1
+        ws.merge_cells(start_row=row_num, start_column=1, end_row=row_num, end_column=len(summary_cols))
+        cell = ws.cell(row=row_num, column=1, value="Abstimmung")
+        cell.font = hdr_font
+        cell.fill = hdr_fill
+        cell.alignment = Alignment(horizontal='left')
+        row_num += 1
+        reconciliation_rows = [
+            ("Topf 1", "Finaler Wert", f['topf_1'], "GUI/TXT/Excel-Summary"),
+            ("Topf 1", "Trade-Details", trade_sums.get('Topf1', 0), "Nachweis-Sheet"),
+            ("Topf 1", "Differenz", f['topf_1'] - trade_sums.get('Topf1', 0), "sollte 0 sein, sofern alle Aktien aus Trade-Details stammen"),
+            ("Topf 2", "Finaler Wert", f['topf_2'], "inkl. Dividenden, Zinsen, FX, Stillhalter"),
+            ("Topf 2", "Trade-Details", trade_sums.get('Topf2', 0), "Trades und Korrekturen"),
+            ("Topf 2", "Nicht-Trade-Anteil", f['topf_2'] - trade_sums.get('Topf2', 0), "Cash-Ertraege/Korrekturen, z.B. Dividenden und Zinsen"),
+            ("Anlage KAP", "Zeile 19 minus Topf 1 minus Topf 2", f['zeile_19'] - (f['topf_1'] + f['topf_2']), "sollte 0 sein"),
+        ]
+        for ci, cn in enumerate(summary_cols, 1):
+            cell = ws.cell(row=row_num, column=ci, value=cn)
+            cell.font = Font(bold=True, size=9)
+            cell.fill = PatternFill("solid", fgColor="e8e8e8")
+            cell.border = thin_border
+        row_num += 1
+        current_area = None
+        for area, label, value, note in reconciliation_rows:
+            if area != current_area:
+                current_area = area
+                ws.merge_cells(start_row=row_num, start_column=1, end_row=row_num, end_column=len(summary_cols))
+                cell = ws.cell(row=row_num, column=1, value=area)
+                cell.font = grp_font
+                cell.fill = grp_fill
+                row_num += 1
+            for ci, val in enumerate([area, label, value, note], 1):
+                cell = ws.cell(row=row_num, column=ci, value=val)
+                cell.font = normal_font
+                cell.border = thin_border
+                if ci == 3 and isinstance(val, (int, float)):
+                    cell.number_format = num_fmt_eur
+            if label in ("Differenz", "Nicht-Trade-Anteil", "Zeile 19 minus Topf 1 minus Topf 2"):
+                for ci in range(1, len(summary_cols) + 1):
+                    ws.cell(row=row_num, column=ci).font = sub_font
+                    ws.cell(row=row_num, column=ci).fill = sub_fill
+            row_num += 1
+        ws.freeze_panes = 'A6'
+
+        ws = ws_details
         cols = ['Datum', 'Handelsdatum', 'Wertpapier', 'ISIN', 'Kategorie',
                 'K/V', 'Stk.', 'Kurs', 'Kostenbasis', 'Erloese',
                 'G/V (Orig.)', 'Kommission', 'Waehrung', 'Wechselkurs', 'G/V (EUR)', 'Anmerkung']
@@ -1573,14 +1721,35 @@ if trade_details:
         ws.freeze_panes = 'A2'
         buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
 
-    xlsx_data = _build_excel(trade_details, trades_by_topf)
-    st.download_button(
-        label=f"Trade-Details als Excel herunterladen ({len(trade_details)} Positionen)",
-        data=xlsx_data,
-        file_name=f"trade_details_{steuerjahr}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True
-    )
+    so_taxable_export = 0
+    so_free_export = 0
+    if has_so_data:
+        so_taxable_export = anlage_so.get('taxable_gain', 0) + anlage_so.get('taxable_loss', 0)
+        so_free_export = anlage_so.get('tax_free_gain', 0) + anlage_so.get('tax_free_loss', 0)
+    export_context = {
+        'final': final,
+        'base_currency': d.get('base_currency', 'USD'),
+        'created_at': created_at,
+        'has_etf_data': has_etf_data,
+        'invstg_aktiv': invstg_aktiv,
+        'has_so_data': has_so_data,
+        'so_taxable': so_taxable_export,
+        'so_free': so_free_export,
+    }
+    try:
+        xlsx_data = _build_excel(trade_details, trades_by_topf, export_context)
+    except ModuleNotFoundError as e:
+        if e.name != 'openpyxl':
+            raise
+        st.warning("Excel-Export nicht verfügbar: Bitte `openpyxl` installieren (`pip install openpyxl`).")
+    else:
+        st.download_button(
+            label=f"Steuerreport als Excel herunterladen ({len(trade_details)} Detailpositionen)",
+            data=xlsx_data,
+            file_name=f"steuerbericht_{steuerjahr}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
 
 
 # ── Plausibilitätscheck (wenn CSV hochgeladen) ─────────────────────────────
@@ -1689,25 +1858,25 @@ if csv_cats:
 section_title(f"Anlage KAP {steuerjahr} · Eintragungen")
 
 kap_rows_html = ""
-if abs(zeile_7) > 0.01:
+if abs(final['zeile_7']) > 0.01:
     kap_rows_html += (
-        kap_row("Z. 7", "Kapitalerträge mit inländischem Steuerabzug", zeile_7, highlight=True)
-        + kap_row("Z. 37", "Kapitalertragsteuer", zeile_37)
-        + kap_row("Z. 38", "Solidaritätszuschlag", zeile_38)
+        kap_row("Z. 7", "Kapitalerträge mit inländischem Steuerabzug", final['zeile_7'], highlight=True)
+        + kap_row("Z. 37", "Kapitalertragsteuer", final['zeile_37'])
+        + kap_row("Z. 38", "Solidaritätszuschlag", final['zeile_38'])
     )
 
 kap_rows_html += (
-    kap_row("Z. 19", "Ausländische Kapitalerträge (Netto)", adj_zeile_19, highlight=True)
-    + kap_row("Z. 20", "Davon: Aktiengewinne", zeile_20)
-    + kap_row("Z. 22", "Verluste ohne Aktien", zeile_22, force_positive=True)
-    + kap_row("Z. 23", "Aktienverluste", zeile_23, force_positive=True)
-    + kap_row("Z. 41", "Anrechenbare ausländische Quellensteuer", quellensteuer)
+    kap_row("Z. 19", "Ausländische Kapitalerträge (Netto)", final['zeile_19'], highlight=True)
+    + kap_row("Z. 20", "Davon: Aktiengewinne", final['zeile_20'])
+    + kap_row("Z. 22", "Verluste ohne Aktien", final['zeile_22'], force_positive=True)
+    + kap_row("Z. 23", "Aktienverluste", final['zeile_23'], force_positive=True)
+    + kap_row("Z. 41", "Anrechenbare ausländische Quellensteuer", final['quellensteuer'])
 )
 
 if has_etf_data and invstg_aktiv:
     kap_rows_html += '<div class="section-title" style="margin-top:1.5rem;">Anlage KAP-INV</div>'
-    kap_rows_html += kap_row("KAP-INV", "Erträge nach Teilfreistellung", etf_net_taxable, highlight=True)
-    kap_rows_html += kap_row("KAP-INV", "Anrechenbare Quellensteuer (ETF)", etf_wht)
+    kap_rows_html += kap_row("KAP-INV", "Erträge nach Teilfreistellung", final['etf_net_taxable'], highlight=True)
+    kap_rows_html += kap_row("KAP-INV", "Anrechenbare Quellensteuer (ETF)", final['etf_wht'])
 
 if has_so_data:
     so_taxable_for_row = anlage_so.get('taxable_gain', 0) + anlage_so.get('taxable_loss', 0)
@@ -1735,7 +1904,7 @@ if n_accounts > 1:
             z41 = rep.get('withholding_tax_eur', 0)
             label = f"Konto {idx+1} ({name})"
             acct_table += f"| {label} | {fmt_de(t1)} | {fmt_de(t2)} | {fmt_de(z7)} | {fmt_de(z19)} | {fmt_de(z37)} | {fmt_de(z38)} | {fmt_de(z41)} |\n"
-        acct_table += f"| **Gesamt** | **{fmt_de(topf_1)}** | **{fmt_de(adj_topf_2)}** | **{fmt_de(zeile_7)}** | **{fmt_de(adj_zeile_19)}** | **{fmt_de(zeile_37)}** | **{fmt_de(zeile_38)}** | **{fmt_de(quellensteuer)}** |\n"
+        acct_table += f"| **Gesamt** | **{fmt_de(final['topf_1'])}** | **{fmt_de(final['topf_2'])}** | **{fmt_de(final['zeile_7'])}** | **{fmt_de(final['zeile_19'])}** | **{fmt_de(final['zeile_37'])}** | **{fmt_de(final['zeile_38'])}** | **{fmt_de(final['quellensteuer'])}** |\n"
         st.markdown(acct_table)
         st.info("Jedes Konto wurde vollständig separat berechnet (eigene Trades, Dividenden, FX-Berechnung, "
                 "Stillhalter-Erkennung). Die Einzelergebnisse wurden anschließend addiert.")
@@ -2169,7 +2338,7 @@ if n_accounts > 1:
     multi_acct_export = f"Konten: {n_accounts} (separat berechnet, Ergebnisse addiert)\n"
 
 report_text = f"""ANLAGE KAP {steuerjahr} - Steuerbericht
-Erstellt: {_dt.now().strftime('%d.%m.%Y %H:%M')}
+Erstellt: {created_at}
 Basiswährung: {d.get('base_currency', 'USD')}
 {multi_acct_export}
 ═══════════════════════════════════════════════════

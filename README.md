@@ -40,7 +40,7 @@ git clone https://github.com/KonvexInvestment/ibkr-steuer.git
 cd ibkr-steuer
 python3 -m venv .venv
 source .venv/bin/activate
-pip install streamlit
+pip install streamlit openpyxl
 streamlit run app.py
 ```
 

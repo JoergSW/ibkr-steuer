@@ -603,6 +603,50 @@ def _build_stillhalter_details_for_assignment(a, strike, expiry, pc, a_qty, mult
     return details
 
 
+def _put_assignment_lot_cost_correction_per_share(closed_lots, det, underlying, shares, default_per_share):
+    """Use realized STK lot cost to decide whether IBKR embedded the put premium."""
+    if det.get('putCall') != 'P':
+        return default_per_share
+
+    shares = abs(safe_float(shares, 0))
+    strike = safe_float(det.get('strike'), 0)
+    if shares <= 0 or strike <= 0:
+        return default_per_share
+
+    relevant_dates = {
+        (det.get('assignment_date') or '')[:10],
+        (det.get('assignment_trade_date') or '')[:10],
+    }
+    relevant_dates.discard('')
+
+    lot_qty = 0.0
+    lot_cost = 0.0
+    for lot in closed_lots:
+        if lot.get('assetCategory') != 'STK':
+            continue
+        sym = (lot.get('underlyingSymbol') or lot.get('symbol', '')).split()[0]
+        if sym != underlying:
+            continue
+        open_date = (lot.get('openDateTime') or '')[:10]
+        if relevant_dates and open_date not in relevant_dates:
+            continue
+        qty = abs(safe_float(lot.get('quantity'), 0))
+        if qty <= 0:
+            continue
+        lot_qty += qty
+        lot_cost += abs(safe_float(lot.get('cost'), 0))
+
+    if lot_qty <= 0 or lot_cost <= 0:
+        return default_per_share
+
+    actual_cost_per_share = lot_cost / lot_qty
+    reduction_per_share = strike - actual_cost_per_share
+    tolerance_per_share = max(0.01, abs(default_per_share) * 0.05)
+    if reduction_per_share <= tolerance_per_share:
+        return 0.0
+    return default_per_share
+
+
 def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrides=None):
     # 0. Detect base currency, tax year, and XML metadata from account_info.csv
     base_currency = 'EUR'  # default — most IBKR accounts for German tax filers are EUR-based
@@ -1160,6 +1204,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         # Instead of separate Korrektur rows, we directly fix the stock trade's
         # cost/fifoPnlRealized/pnl_eur so the Excel shows the correct per-trade values.
         pending_stk_corrections = {}  # underlying_symbol → list of corrections
+        closed_lots_for_put_basis = []
+        _cl_basis_path = os.path.join(ib_tax_dir, 'closed_lots.csv')
+        if os.path.exists(_cl_basis_path):
+            closed_lots_for_put_basis = load_csv(_cl_basis_path)
         for det in stillhalter_details:
             underlying = det['symbol'].split()[0] if det['symbol'] else ''
             u_isin = symbol_to_isin.get(underlying, '')
@@ -1195,15 +1243,13 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             mult = det.get('multiplier', 100)
             total_shares = det['quantity'] * mult
             if total_shares > 0:
+                premium_per_share_raw = det['premium_raw'] / total_shares
+                premium_per_share_raw = _put_assignment_lot_cost_correction_per_share(
+                    closed_lots_for_put_basis, det, underlying, total_shares, premium_per_share_raw
+                )
                 pending_stk_corrections.setdefault(underlying, []).append({
-                    'premium_per_share_raw': det['premium_raw'] / total_shares,
+                    'premium_per_share_raw': premium_per_share_raw,
                     'remaining_shares': total_shares,
-                    'skip_cost_adjustment': (
-                        det.get('putCall') == 'P'
-                        and (det.get('assignment_date') or '')[:10]
-                        and (det.get('assignment_trade_date') or '')[:10]
-                        and (det.get('assignment_date') or '')[:10] != (det.get('assignment_trade_date') or '')[:10]
-                    ),
                 })
 
         # Apply pending corrections to stock trade debug_rows
@@ -1235,8 +1281,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 if corr['remaining_shares'] <= 0 or remaining_qty <= 0:
                     continue
                 shares = min(remaining_qty, corr['remaining_shares'])
-                if not corr.get('skip_cost_adjustment'):
-                    total_correction_raw += corr['premium_per_share_raw'] * shares
+                total_correction_raw += corr['premium_per_share_raw'] * shares
                 corr['remaining_shares'] -= shares
                 remaining_qty -= shares
             if total_correction_raw > 0:

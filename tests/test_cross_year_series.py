@@ -368,7 +368,8 @@ def test_issue_56_current_year_zufluss_uses_underlying():
     print(f"    Zufluss = {audit.get('zufluss_premium_eur', 0):.2f} EUR (GPN offen, SQ geschlossen)")
 
 
-def _mu_put_assignment_trade_set(stock_cost, stock_pnl, assignment_datetime="2025-04-28 16:20:00"):
+def _mu_put_assignment_trade_set(stock_cost, stock_pnl, assignment_datetime="2025-04-28 16:20:00",
+                                 stock_book_cost=None):
     """Synthetic MU weekly put assignment based on the user-reported screenshots."""
     premium = 184.37773
     return [
@@ -425,6 +426,29 @@ def _mu_put_assignment_trade_set(stock_cost, stock_pnl, assignment_datetime="202
             "proceeds": "0",
         },
         {
+            "tradeID": "mu_stock_assignment",
+            "assetCategory": "STK",
+            "transactionType": "BookTrade",
+            "buySell": "BUY",
+            "openCloseIndicator": "O",
+            "underlyingSymbol": "MU",
+            "symbol": "MU",
+            "description": "MICRON TECHNOLOGY INC",
+            "quantity": "100",
+            "tradePrice": "84",
+            "closePrice": "78.56",
+            "ibCommission": "0",
+            "fxRateToBase": "0.87551",
+            "currency": "USD",
+            "dateTime": "2025-04-25 16:20:00",
+            "tradeDate": "2025-04-25",
+            "reportDate": assignment_datetime[:10],
+            "fifoPnlRealized": "0",
+            "cost": str(stock_book_cost if stock_book_cost is not None else stock_cost),
+            "proceeds": "-8400",
+            "isin": "US5951121038",
+        },
+        {
             "tradeID": "mu_stock_sale",
             "assetCategory": "STK",
             "transactionType": "ExchTrade",
@@ -470,7 +494,7 @@ def _mu_closed_lot(cost):
 
 def test_put_assignment_does_not_double_correct_strike_basis():
     """TC7: Weekly/early put assignment where IBKR already uses strike as stock basis."""
-    trades = _mu_put_assignment_trade_set(8400.0, 3236.98)
+    trades = _mu_put_assignment_trade_set(8400.0, 3236.98, stock_book_cost=8400.0)
     rd = calculate_for_trades(
         trades,
         tax_year=2025,
@@ -498,7 +522,10 @@ def test_put_assignment_corrects_reduced_cost_basis():
     premium = 184.37773
     reduced_cost = 8400.0 - premium
     reduced_pnl = 11636.98 - reduced_cost
-    trades = _mu_put_assignment_trade_set(reduced_cost, reduced_pnl, assignment_datetime="2025-04-25 16:20:00")
+    trades = _mu_put_assignment_trade_set(
+        reduced_cost, reduced_pnl, assignment_datetime="2025-04-25 16:20:00",
+        stock_book_cost=reduced_cost
+    )
     rd = calculate_for_trades(
         trades,
         tax_year=2025,
@@ -518,6 +545,30 @@ def test_put_assignment_corrects_reduced_cost_basis():
     print(f"    {reduced_cost:.2f} USD -> {stock_rows[0]['cost']:.2f} USD")
 
 
+def test_same_day_put_assignment_does_not_double_correct_strike_basis():
+    """TC9: Early/same-day put assignment where IBKR already uses strike as stock basis."""
+    trades = _mu_put_assignment_trade_set(
+        8400.0, 3236.98, assignment_datetime="2025-04-25 16:20:00",
+        stock_book_cost=8400.0
+    )
+    rd = calculate_for_trades(
+        trades,
+        tax_year=2025,
+        closed_lots=_mu_closed_lot(8400.0),
+        conversion_rates=[
+            {"reportDate": "2025-04-25", "fromCurrency": "USD", "toCurrency": "EUR", "rate": "0.87998"},
+            {"reportDate": "2025-06-11", "fromCurrency": "USD", "toCurrency": "EUR", "rate": "0.87050"},
+        ],
+    )
+    stock_rows = [r for r in rd["trade_details"] if r.get("symbol") == "MU" and r.get("source") == "trades"]
+    assert len(stock_rows) == 1, f"erwartet 1 MU-Aktienzeile, aktuell {len(stock_rows)}"
+    assert_close(stock_rows[0]["cost"], 8400.0, label="TC9 stock cost")
+    assert_close(stock_rows[0]["fifoPnlRealized"], 3236.98, label="TC9 stock pnl raw")
+
+    print("  TC9 Same-Day-Put-Assignment mit Strike-Basis nicht doppelt korrigiert: OK")
+    print(f"    Kostenbasis bleibt {stock_rows[0]['cost']:.2f} USD")
+
+
 if __name__ == "__main__":
     test_cross_year_put_series()
     test_cross_year_call_series()
@@ -527,4 +578,5 @@ if __name__ == "__main__":
     test_issue_56_current_year_zufluss_uses_underlying()
     test_put_assignment_does_not_double_correct_strike_basis()
     test_put_assignment_corrects_reduced_cost_basis()
-    print("\nOK: alle 8 TCs gruen")
+    test_same_day_put_assignment_does_not_double_correct_strike_basis()
+    print("\nOK: alle 9 TCs gruen")

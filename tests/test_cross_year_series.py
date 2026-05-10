@@ -105,7 +105,7 @@ def make_buy_close(date, qty, price, pnl, strike="100", expiry="2024-12-20",
     }
 
 
-def calculate_for_trades(trades, tax_year=2022):
+def calculate_for_trades(trades, tax_year=2022, closed_lots=None, conversion_rates=None):
     fieldnames = sorted({k for row in trades for k in row})
     with tempfile.TemporaryDirectory() as tmp:
         with open(os.path.join(tmp, "account_info.csv"), "w", newline="") as f:
@@ -116,6 +116,17 @@ def calculate_for_trades(trades, tax_year=2022):
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(trades)
+        if closed_lots:
+            lot_fields = sorted({k for row in closed_lots for k in row})
+            with open(os.path.join(tmp, "closed_lots.csv"), "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=lot_fields)
+                writer.writeheader()
+                writer.writerows(closed_lots)
+        if conversion_rates:
+            with open(os.path.join(tmp, "conversion_rates.csv"), "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=["reportDate", "fromCurrency", "toCurrency", "rate"])
+                writer.writeheader()
+                writer.writerows(conversion_rates)
         with contextlib.redirect_stdout(io.StringIO()):
             return calculate_tax(tmp)
 
@@ -357,6 +368,156 @@ def test_issue_56_current_year_zufluss_uses_underlying():
     print(f"    Zufluss = {audit.get('zufluss_premium_eur', 0):.2f} EUR (GPN offen, SQ geschlossen)")
 
 
+def _mu_put_assignment_trade_set(stock_cost, stock_pnl, assignment_datetime="2025-04-28 16:20:00"):
+    """Synthetic MU weekly put assignment based on the user-reported screenshots."""
+    premium = 184.37773
+    return [
+        {
+            "tradeID": "mu_put_sell",
+            "assetCategory": "OPT",
+            "transactionType": "ExchTrade",
+            "buySell": "SELL",
+            "openCloseIndicator": "O",
+            "putCall": "P",
+            "strike": "84",
+            "expiry": "2025-04-25",
+            "underlyingSymbol": "MU",
+            "symbol": "MU 25APR25 84 P",
+            "description": "MU 25APR25 84 P",
+            "quantity": "-1",
+            "tradePrice": str(premium / 100),
+            "closePrice": str(premium / 100),
+            "multiplier": "100",
+            "ibCommission": "0",
+            "fxRateToBase": "0.87998",
+            "currency": "USD",
+            "dateTime": "2025-04-25 10:00:00",
+            "tradeDate": "2025-04-25",
+            "reportDate": "2025-04-25",
+            "fifoPnlRealized": "0",
+            "cost": "0",
+            "proceeds": str(premium),
+        },
+        {
+            "tradeID": "mu_put_assignment",
+            "assetCategory": "OPT",
+            "transactionType": "BookTrade",
+            "buySell": "BUY",
+            "openCloseIndicator": "C",
+            "putCall": "P",
+            "strike": "84",
+            "expiry": "2025-04-25",
+            "underlyingSymbol": "MU",
+            "symbol": "MU 25APR25 84 P",
+            "description": "MU 25APR25 84 P",
+            "quantity": "1",
+            "tradePrice": "0",
+            "closePrice": "4.22",
+            "multiplier": "100",
+            "ibCommission": "0",
+            "fxRateToBase": "0.87551",
+            "currency": "USD",
+            "dateTime": assignment_datetime,
+            "tradeDate": "2025-04-25",
+            "reportDate": assignment_datetime[:10],
+            "fifoPnlRealized": "0",
+            "cost": "0",
+            "proceeds": "0",
+        },
+        {
+            "tradeID": "mu_stock_sale",
+            "assetCategory": "STK",
+            "transactionType": "ExchTrade",
+            "buySell": "SELL",
+            "openCloseIndicator": "C",
+            "underlyingSymbol": "MU",
+            "symbol": "MU",
+            "description": "MICRON TECHNOLOGY INC",
+            "quantity": "-100",
+            "tradePrice": "116.38",
+            "closePrice": "116.38",
+            "ibCommission": "-1.02",
+            "fxRateToBase": "0.8705",
+            "currency": "USD",
+            "dateTime": "2025-06-11 10:00:00",
+            "tradeDate": "2025-06-11",
+            "reportDate": "2025-06-11",
+            "fifoPnlRealized": str(stock_pnl),
+            "cost": str(stock_cost),
+            "proceeds": "11636.98",
+            "isin": "US5951121038",
+        },
+    ]
+
+
+def _mu_closed_lot(cost):
+    return [{
+        "assetCategory": "STK",
+        "currency": "USD",
+        "reportDate": "2025-06-11",
+        "dateTime": "2025-06-11 10:00:00",
+        "openDateTime": "2025-04-25 16:20:00",
+        "quantity": "100",
+        "cost": str(cost),
+        "fifoPnlRealized": "3236.98",
+        "fxRateToBase": "0.8705",
+        "symbol": "MU",
+        "description": "MICRON TECHNOLOGY INC",
+        "isin": "US5951121038",
+        "underlyingSymbol": "MU",
+    }]
+
+
+def test_put_assignment_does_not_double_correct_strike_basis():
+    """TC7: Weekly/early put assignment where IBKR already uses strike as stock basis."""
+    trades = _mu_put_assignment_trade_set(8400.0, 3236.98)
+    rd = calculate_for_trades(
+        trades,
+        tax_year=2025,
+        closed_lots=_mu_closed_lot(8400.0),
+        conversion_rates=[
+            {"reportDate": "2025-04-25", "fromCurrency": "USD", "toCurrency": "EUR", "rate": "0.87998"},
+            {"reportDate": "2025-06-11", "fromCurrency": "USD", "toCurrency": "EUR", "rate": "0.87050"},
+        ],
+    )
+    stock_rows = [r for r in rd["trade_details"] if r.get("symbol") == "MU" and r.get("source") == "trades"]
+    assert len(stock_rows) == 1, f"erwartet 1 MU-Aktienzeile, aktuell {len(stock_rows)}"
+    assert_close(stock_rows[0]["cost"], 8400.0, label="TC7 stock cost")
+    assert_close(stock_rows[0]["fifoPnlRealized"], 3236.98, label="TC7 stock pnl raw")
+
+    fx_details = rd.get("fx_correction_details", [])
+    assert len(fx_details) == 1, f"erwartet 1 Tageskurs-Lot, aktuell {len(fx_details)}"
+    assert_close(fx_details[0]["cost"], 8400.0, label="TC7 Tageskurs cost")
+
+    print("  TC7 Put-Assignment mit Strike-Basis nicht doppelt korrigiert: OK")
+    print(f"    Kostenbasis bleibt {stock_rows[0]['cost']:.2f} USD")
+
+
+def test_put_assignment_corrects_reduced_cost_basis():
+    """TC8: Put assignment where IBKR stock basis is reduced by the premium."""
+    premium = 184.37773
+    reduced_cost = 8400.0 - premium
+    reduced_pnl = 11636.98 - reduced_cost
+    trades = _mu_put_assignment_trade_set(reduced_cost, reduced_pnl, assignment_datetime="2025-04-25 16:20:00")
+    rd = calculate_for_trades(
+        trades,
+        tax_year=2025,
+        closed_lots=_mu_closed_lot(reduced_cost),
+        conversion_rates=[
+            {"reportDate": "2025-04-25", "fromCurrency": "USD", "toCurrency": "EUR", "rate": "0.87998"},
+            {"reportDate": "2025-06-11", "fromCurrency": "USD", "toCurrency": "EUR", "rate": "0.87050"},
+        ],
+    )
+    stock_rows = [r for r in rd["trade_details"] if r.get("symbol") == "MU" and r.get("source") == "trades"]
+    assert len(stock_rows) == 1, f"erwartet 1 MU-Aktienzeile, aktuell {len(stock_rows)}"
+    assert_close(stock_rows[0]["cost"], 8400.0, label="TC8 stock cost")
+    assert_close(stock_rows[0]["fifoPnlRealized"], 3236.98, label="TC8 stock pnl raw")
+    assert_close(rd["fx_correction_details"][0]["cost"], 8400.0, label="TC8 Tageskurs cost")
+
+    print("  TC8 Put-Assignment mit reduzierter IBKR-Basis korrigiert: OK")
+    print(f"    {reduced_cost:.2f} USD -> {stock_rows[0]['cost']:.2f} USD")
+
+
 if __name__ == "__main__":
     test_cross_year_put_series()
     test_cross_year_call_series()
@@ -364,4 +525,6 @@ if __name__ == "__main__":
     test_mixed_year_assignment_splits_cross_year_premium()
     test_issue_56_prior_year_correction_uses_underlying()
     test_issue_56_current_year_zufluss_uses_underlying()
-    print("\nOK: alle 6 TCs gruen")
+    test_put_assignment_does_not_double_correct_strike_basis()
+    test_put_assignment_corrects_reduced_cost_basis()
+    print("\nOK: alle 8 TCs gruen")

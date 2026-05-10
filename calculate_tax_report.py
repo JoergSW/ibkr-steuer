@@ -595,6 +595,7 @@ def _build_stillhalter_details_for_assignment(a, strike, expiry, pc, a_qty, mult
             'premium_raw': part['premium_raw'],
             'commission_raw': part['commission_raw'],
             'assignment_date': str(assignment_date) if assignment_date else '',
+            'assignment_trade_date': (a.get('tradeDate') or (a.get('dateTime') or '')[:10]),
             'orig_sell_date': str(part['orig_sell_date']) if part['orig_sell_date'] else '',
             'orig_sell_year': yr,
             'is_cross_year': yr < tax_year,
@@ -1197,6 +1198,12 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 pending_stk_corrections.setdefault(underlying, []).append({
                     'premium_per_share_raw': det['premium_raw'] / total_shares,
                     'remaining_shares': total_shares,
+                    'skip_cost_adjustment': (
+                        det.get('putCall') == 'P'
+                        and (det.get('assignment_date') or '')[:10]
+                        and (det.get('assignment_trade_date') or '')[:10]
+                        and (det.get('assignment_date') or '')[:10] != (det.get('assignment_trade_date') or '')[:10]
+                    ),
                 })
 
         # Apply pending corrections to stock trade debug_rows
@@ -1228,7 +1235,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 if corr['remaining_shares'] <= 0 or remaining_qty <= 0:
                     continue
                 shares = min(remaining_qty, corr['remaining_shares'])
-                total_correction_raw += corr['premium_per_share_raw'] * shares
+                if not corr.get('skip_cost_adjustment'):
+                    total_correction_raw += corr['premium_per_share_raw'] * shares
                 corr['remaining_shares'] -= shares
                 remaining_qty -= shares
             if total_correction_raw > 0:

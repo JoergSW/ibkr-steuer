@@ -109,6 +109,9 @@ def extract_fx_multi_xml(xml_files, output_dir):
 
         # Build dedup keys from existing trades
         def trade_dedup_key(t):
+            trade_id = t.get('tradeID', '')
+            if trade_id:
+                return ('tradeID', trade_id)
             return (t.get('dateTime', ''), t.get('isin', ''), t.get('buySell', ''),
                     t.get('quantity', ''), t.get('closePrice', ''), t.get('fifoPnlRealized', ''))
 

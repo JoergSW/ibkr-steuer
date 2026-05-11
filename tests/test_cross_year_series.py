@@ -682,6 +682,101 @@ def test_prior_year_put_lot_sold_in_tax_year_is_still_corrected():
     print(f"    Kostenbasis {stock_rows[0]['cost']:.2f} USD")
 
 
+def test_same_year_put_requires_matching_closed_lot():
+    """TC12: Same-Year-Put darf keinen alten Aktienverkauf desselben Symbols korrigieren."""
+    trades = [
+        {
+            "tradeID": "mu_old_stock_sale",
+            "assetCategory": "STK",
+            "transactionType": "ExchTrade",
+            "buySell": "SELL",
+            "openCloseIndicator": "C",
+            "underlyingSymbol": "MU",
+            "symbol": "MU",
+            "description": "MICRON TECHNOLOGY INC",
+            "quantity": "-100",
+            "tradePrice": "90",
+            "closePrice": "90",
+            "ibCommission": "0",
+            "fxRateToBase": "1.0",
+            "currency": "USD",
+            "dateTime": "2025-01-10 10:00:00",
+            "tradeDate": "2025-01-10",
+            "reportDate": "2025-01-10",
+            "fifoPnlRealized": "1000",
+            "cost": "8000",
+            "proceeds": "9000",
+            "isin": "US5951121038",
+        },
+    ] + _mu_put_assignment_trade_set(
+        8400.0, 3236.98, assignment_datetime="2025-04-25 16:20:00",
+        stock_book_cost=8400.0
+    )[:3]
+    closed_lots = [{
+        "assetCategory": "STK",
+        "currency": "USD",
+        "reportDate": "2025-01-10",
+        "dateTime": "2025-01-10 10:00:00",
+        "openDateTime": "2024-12-01 10:00:00",
+        "quantity": "100",
+        "cost": "8000",
+        "fifoPnlRealized": "1000",
+        "fxRateToBase": "1.0",
+        "symbol": "MU",
+        "description": "MICRON TECHNOLOGY INC",
+        "isin": "US5951121038",
+        "underlyingSymbol": "MU",
+    }]
+    rd = calculate_for_trades(trades, tax_year=2025, closed_lots=closed_lots)
+    stock_rows = [r for r in rd["trade_details"] if r.get("symbol") == "MU" and r.get("source") == "trades"]
+    assert len(stock_rows) == 1, f"erwartet 1 MU-Aktienzeile, aktuell {len(stock_rows)}"
+    assert_close(stock_rows[0]["cost"], 8000.0, label="TC12 stock cost")
+    assert_close(stock_rows[0]["fifoPnlRealized"], 1000.0, label="TC12 stock pnl raw")
+    assert not stock_rows[0].get("stillhalter_adjusted"), "alter MU-Verkauf darf nicht korrigiert werden"
+
+    print("  TC12 Same-Year-Put ohne CLOSED_LOT-Match korrigiert keinen Altbestand: OK")
+    print(f"    alter MU-Verkauf bleibt bei {stock_rows[0]['cost']:.2f} USD Kostenbasis")
+
+
+def test_zufluss_fifo_current_close_consumes_prior_sell_first():
+    """TC13: Ein Steuerjahr-Rueckkauf schliesst FIFO erst den Vorjahres-Short."""
+    trades = [
+        make_sell("2024-12-15", 1, 5.00, strike="100", expiry="2025-03-21", underlying="FIFO"),
+        make_sell("2025-01-10", 1, 7.00, strike="100", expiry="2025-03-21", underlying="FIFO"),
+        make_buy_close("2025-01-20", 1, 2.00, -300, strike="100", expiry="2025-03-21", underlying="FIFO"),
+    ]
+    rd = calculate_for_trades(trades, tax_year=2025)
+    audit = rd.get("audit", {})
+
+    assert_close(audit.get("prior_zufluss_correction_eur", 0), 499.0,
+                 label="TC13 prior_zufluss_correction_eur")
+    assert_close(audit.get("zufluss_premium_eur", 0), 699.0,
+                 label="TC13 zufluss_premium_eur")
+
+    print("  TC13 Zufluss-FIFO: Steuerjahr-Close konsumiert Vorjahres-Sell zuerst: OK")
+    print("    Vorjahreskorrektur 499.00 EUR, offener Steuerjahr-Zufluss 699.00 EUR")
+
+
+def test_zufluss_fifo_prior_close_consumes_prior_sell_before_tax_year():
+    """TC14: Bereits im Vorjahr geschlossene Shorts duerfen 2025 nicht erneut korrigiert werden."""
+    trades = [
+        make_sell("2024-12-01", 1, 5.00, strike="100", expiry="2025-03-21", underlying="FIFO"),
+        make_buy_close("2024-12-15", 1, 1.00, 399, strike="100", expiry="2025-03-21", underlying="FIFO"),
+        make_sell("2025-01-10", 1, 7.00, strike="100", expiry="2025-03-21", underlying="FIFO"),
+        make_buy_close("2025-01-20", 1, 2.00, 499, strike="100", expiry="2025-03-21", underlying="FIFO"),
+    ]
+    rd = calculate_for_trades(trades, tax_year=2025)
+    audit = rd.get("audit", {})
+
+    assert_close(audit.get("prior_zufluss_correction_eur", 0), 0.0,
+                 label="TC14 prior_zufluss_correction_eur")
+    assert_close(audit.get("zufluss_premium_eur", 0), 0.0,
+                 label="TC14 zufluss_premium_eur")
+
+    print("  TC14 Zufluss-FIFO: im Vorjahr geschlossener Short bleibt erledigt: OK")
+    print("    keine falsche Vorjahreskorrektur in 2025")
+
+
 if __name__ == "__main__":
     test_cross_year_put_series()
     test_cross_year_call_series()
@@ -694,4 +789,7 @@ if __name__ == "__main__":
     test_same_day_put_assignment_does_not_double_correct_strike_basis()
     test_prior_year_put_lot_sold_before_tax_year_does_not_touch_current_sale()
     test_prior_year_put_lot_sold_in_tax_year_is_still_corrected()
-    print("\nOK: alle 11 TCs gruen")
+    test_same_year_put_requires_matching_closed_lot()
+    test_zufluss_fifo_current_close_consumes_prior_sell_first()
+    test_zufluss_fifo_prior_close_consumes_prior_sell_before_tax_year()
+    print("\nOK: alle 14 TCs gruen")

@@ -603,25 +603,29 @@ def _build_stillhalter_details_for_assignment(a, strike, expiry, pc, a_qty, mult
     return details
 
 
-def _put_assignment_lot_cost_correction_per_share(closed_lots, det, underlying, shares, default_per_share):
-    """Use realized STK lot cost to decide whether IBKR embedded the put premium."""
-    if det.get('putCall') != 'P':
-        return default_per_share
-
-    shares = abs(safe_float(shares, 0))
-    strike = safe_float(det.get('strike'), 0)
-    if shares <= 0 or strike <= 0:
-        return default_per_share
-
-    relevant_dates = {
+def _put_assignment_relevant_dates(det):
+    dates = {
         (det.get('assignment_date') or '')[:10],
         (det.get('assignment_trade_date') or '')[:10],
     }
-    relevant_dates.discard('')
+    dates.discard('')
+    return dates
 
-    lot_qty = 0.0
-    lot_cost = 0.0
-    for lot in closed_lots:
+
+def _put_assignment_closed_lot_matches(closed_lots, det, underlying, shares):
+    """Return STK closed-lot slices that originate from this put assignment."""
+    if det.get('putCall') != 'P':
+        return []
+
+    remaining = abs(safe_float(shares, 0))
+    if remaining <= 0:
+        return []
+
+    relevant_dates = _put_assignment_relevant_dates(det)
+    matches = []
+    for lot in sorted(closed_lots, key=lambda x: x.get('dateTime') or x.get('reportDate') or ''):
+        if remaining <= 0:
+            break
         if lot.get('assetCategory') != 'STK':
             continue
         sym = (lot.get('underlyingSymbol') or lot.get('symbol', '')).split()[0]
@@ -633,10 +637,36 @@ def _put_assignment_lot_cost_correction_per_share(closed_lots, det, underlying, 
         qty = abs(safe_float(lot.get('quantity'), 0))
         if qty <= 0:
             continue
-        lot_qty += qty
-        lot_cost += abs(safe_float(lot.get('cost'), 0))
+        take = min(qty, remaining)
+        close_date = (lot.get('reportDate') or lot.get('dateTime') or '')[:10]
+        matches.append({
+            'shares': take,
+            'cost': abs(safe_float(lot.get('cost'), 0)) * take / qty,
+            'open_date': open_date,
+            'close_date': close_date,
+        })
+        remaining -= take
+    return matches
+
+
+def _put_assignment_lot_cost_correction_per_share(closed_lots, det, underlying, shares, default_per_share,
+                                                  require_match=False):
+    """Use realized STK lot cost to decide whether IBKR embedded the put premium."""
+    if det.get('putCall') != 'P':
+        return default_per_share
+
+    shares = abs(safe_float(shares, 0))
+    strike = safe_float(det.get('strike'), 0)
+    if shares <= 0 or strike <= 0:
+        return default_per_share
+
+    matches = _put_assignment_closed_lot_matches(closed_lots, det, underlying, shares)
+    lot_qty = sum(m['shares'] for m in matches)
+    lot_cost = sum(m['cost'] for m in matches)
 
     if lot_qty <= 0 or lot_cost <= 0:
+        if require_match:
+            return None
         return default_per_share
 
     actual_cost_per_share = lot_cost / lot_qty
@@ -1155,19 +1185,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         _so_premium_lookup[key]['premium_eur'] += det.get('premium_eur', 0)
 
     if stillhalter_premium_eur > 0:
-        # Build set of underlying symbols that have stock SELL PnL in tax_year
-        stk_sold_symbols = set()
-        for t in trades:
-            if t.get('assetCategory') != 'STK':
-                continue
-            rd = parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))
-            if not rd or rd.year != tax_year:
-                continue
-            if abs(safe_float(t.get('fifoPnlRealized'))) < 0.01:
-                continue
-            sym_parts = (t.get('underlyingSymbol') or t.get('symbol', '')).split()
-            if sym_parts:
-                stk_sold_symbols.add(sym_parts[0])
+        closed_lots_for_put_basis = []
+        _cl_basis_path = os.path.join(ib_tax_dir, 'closed_lots.csv')
+        if os.path.exists(_cl_basis_path):
+            closed_lots_for_put_basis = load_csv(_cl_basis_path)
 
         # Split: check if underlying is an InvStG ETF
         stk_premium = 0.0
@@ -1176,21 +1197,32 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         for det in stillhalter_details:
             underlying = det['symbol'].split()[0] if det['symbol'] else ''
             underlying_isin = symbol_to_isin.get(underlying, '')
+            source_premium_eur = det['premium_eur']
 
             # Put assignment: only subtract from stocks/ETF if stock was sold in tax_year
             # (if not sold, premium is in cost basis only — not yet in stocks_gain)
-            if det['putCall'] == 'P' and underlying not in stk_sold_symbols:
-                put_nosell_premium += det['premium_eur']
-                continue
+            if det['putCall'] == 'P':
+                total_shares = det['quantity'] * det.get('multiplier', 100)
+                matched_shares = sum(
+                    m['shares'] for m in _put_assignment_closed_lot_matches(
+                        closed_lots_for_put_basis, det, underlying, total_shares
+                    )
+                )
+                if matched_shares <= 0:
+                    put_nosell_premium += det['premium_eur']
+                    continue
+                matched_ratio = min(1.0, matched_shares / total_shares) if total_shares else 0.0
+                source_premium_eur = det['premium_eur'] * matched_ratio
+                put_nosell_premium += det['premium_eur'] - source_premium_eur
 
             if underlying_isin and underlying_isin in etf_isins:
                 cls = _effective_classification(underlying_isin)
                 # anlage_so-Underlyings nicht als KAP-INV-Prämie zählen (Issue #51):
                 # Optionsprämie bleibt §20 Abs. 1 Nr. 11 EStG (Topf 2), aber nicht KAP-INV.
                 if cls not in ('no_invstg', 'anlage_so'):
-                    etf_premium += det['premium_eur']
+                    etf_premium += source_premium_eur
                     continue
-            stk_premium += det['premium_eur']
+            stk_premium += source_premium_eur
 
         # NOTE: stocks_gain/etf_invstg_gain are NOT subtracted here.
         # The per-trade gain/loss split happens below in pending_stk_corrections,
@@ -1204,16 +1236,18 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         # Instead of separate Korrektur rows, we directly fix the stock trade's
         # cost/fifoPnlRealized/pnl_eur so the Excel shows the correct per-trade values.
         pending_stk_corrections = {}  # underlying_symbol → list of corrections
-        closed_lots_for_put_basis = []
-        _cl_basis_path = os.path.join(ib_tax_dir, 'closed_lots.csv')
-        if os.path.exists(_cl_basis_path):
-            closed_lots_for_put_basis = load_csv(_cl_basis_path)
         for det in stillhalter_details:
             underlying = det['symbol'].split()[0] if det['symbol'] else ''
             u_isin = symbol_to_isin.get(underlying, '')
             pc_label = 'Call' if det['putCall'] == 'C' else 'Put'
             # Determine source topf
-            if det['putCall'] == 'P' and underlying not in stk_sold_symbols:
+            total_shares_for_put = det['quantity'] * det.get('multiplier', 100)
+            put_lot_matches = []
+            if det['putCall'] == 'P':
+                put_lot_matches = _put_assignment_closed_lot_matches(
+                    closed_lots_for_put_basis, det, underlying, total_shares_for_put
+                )
+            if det['putCall'] == 'P' and not put_lot_matches:
                 source_topf = 'Topf2'  # put_nosell: premium only in Topf 2, no subtraction
             elif u_isin and u_isin in etf_isins and _effective_classification(u_isin) == 'anlage_so':
                 source_topf = 'Anlage SO'
@@ -1244,13 +1278,25 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             total_shares = det['quantity'] * mult
             if total_shares > 0:
                 premium_per_share_raw = det['premium_raw'] / total_shares
-                premium_per_share_raw = _put_assignment_lot_cost_correction_per_share(
-                    closed_lots_for_put_basis, det, underlying, total_shares, premium_per_share_raw
-                )
-                pending_stk_corrections.setdefault(underlying, []).append({
-                    'premium_per_share_raw': premium_per_share_raw,
-                    'remaining_shares': total_shares,
-                })
+                if det['putCall'] == 'P':
+                    premium_per_share_raw = _put_assignment_lot_cost_correction_per_share(
+                        closed_lots_for_put_basis, det, underlying, total_shares,
+                        premium_per_share_raw, require_match=True
+                    )
+                    if premium_per_share_raw is None:
+                        continue
+                    for match in put_lot_matches:
+                        pending_stk_corrections.setdefault(underlying, []).append({
+                            'premium_per_share_raw': premium_per_share_raw,
+                            'remaining_shares': match['shares'],
+                            'close_date': match['close_date'],
+                        })
+                else:
+                    pending_stk_corrections.setdefault(underlying, []).append({
+                        'premium_per_share_raw': premium_per_share_raw,
+                        'remaining_shares': total_shares,
+                        'close_date': '',
+                    })
 
         # Apply pending corrections to stock trade debug_rows
         # IBKR embeds the premium in the stock's cost basis → cost too low, G/V too high.
@@ -1279,6 +1325,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             remaining_qty = qty
             for corr in pending_stk_corrections[row_symbol]:
                 if corr['remaining_shares'] <= 0 or remaining_qty <= 0:
+                    continue
+                corr_close_date = corr.get('close_date') or ''
+                row_close_date = (row.get('reportDate') or row.get('dateTime') or '')[:10]
+                if corr_close_date and corr_close_date != row_close_date:
                     continue
                 shares = min(remaining_qty, corr['remaining_shares'])
                 total_correction_raw += corr['premium_per_share_raw'] * shares
@@ -1385,134 +1435,159 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     zufluss_premium_eur = 0.0
     zufluss_count = 0
     zufluss_details = []
+    prior_zufluss_details = []
 
-    # All OPT SELL ExchTrade with PnL≈0 in tax_year (= opening short positions)
-    sell_opens = [t for t in trades
-                  if t.get('assetCategory') in ('OPT', 'FOP', 'FSFOP')
-                  and t.get('transactionType') == 'ExchTrade'
-                  and t.get('buySell') == 'SELL'
-                  and abs(safe_float(t.get('fifoPnlRealized'))) < 0.01
-                  and (d := parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))) is not None
-                  and d.year == tax_year]
-
-    # Group by full option series. underlyingSymbol is required because
-    # different underlyings can share strike/expiry/putCall.
     from collections import defaultdict
-    instr_sells = defaultdict(list)   # {key: [sell_trades]}
-    instr_closes = defaultdict(int)   # {key: total_closed_qty}
 
-    for t in sell_opens:
-        key = (t.get('assetCategory'), t.get('underlyingSymbol', ''),
-               t.get('strike'), t.get('expiry'), t.get('putCall'))
-        instr_sells[key].append(t)
+    def _option_key(t):
+        return (t.get('assetCategory'), t.get('underlyingSymbol', ''),
+                t.get('strike'), t.get('expiry'), t.get('putCall'))
 
-    # Count closing BUYs (Glattstellungen) and BookTrades (Assignments) in tax_year
+    def _option_sort_key(t):
+        return t.get('dateTime') or t.get('tradeDate') or t.get('reportDate') or ''
+
+    series_events = defaultdict(list)
+    all_sell_open_keys = set()
     for t in trades:
         if t.get('assetCategory') not in ('OPT', 'FOP', 'FSFOP'):
             continue
         rd = parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))
-        if not rd or rd.year != tax_year:
+        if not rd or rd.year > tax_year:
             continue
-        key = (t.get('assetCategory'), t.get('underlyingSymbol', ''),
-               t.get('strike'), t.get('expiry'), t.get('putCall'))
-        if key not in instr_sells:
-            continue
-        # Closing BUY (Glattstellung) — has PnL ≠ 0
-        if t.get('buySell') == 'BUY' and t.get('transactionType') == 'ExchTrade' and abs(safe_float(t.get('fifoPnlRealized'))) >= 0.01:
-            instr_closes[key] += abs(int(safe_float(t.get('quantity'))))
-        # BookTrade BUY (Assignment)
-        if t.get('buySell') == 'BUY' and t.get('transactionType') == 'BookTrade':
-            instr_closes[key] += abs(int(safe_float(t.get('quantity'))))
+        key = _option_key(t)
+        if (t.get('transactionType') == 'ExchTrade' and t.get('buySell') == 'SELL'
+                and abs(safe_float(t.get('fifoPnlRealized'))) < 0.01):
+            series_events[key].append(t)
+            all_sell_open_keys.add(key)
+        elif ((t.get('transactionType') == 'ExchTrade' and t.get('buySell') == 'BUY'
+               and abs(safe_float(t.get('fifoPnlRealized'))) >= 0.01)
+              or (t.get('transactionType') == 'BookTrade' and t.get('buySell') == 'BUY')):
+            series_events[key].append(t)
 
-    for key, sells in instr_sells.items():
-        total_sell_qty = sum(abs(int(safe_float(s.get('quantity')))) for s in sells)
-        closed_qty = instr_closes.get(key, 0)
-        unclosed_qty = max(0, total_sell_qty - closed_qty)
+    current_zufluss_by_key = {}
 
-        if unclosed_qty <= 0:
-            continue
+    def _add_current_zufluss(key, sell, open_qty):
+        components = _premium_components_for_consumed_sell(
+            sell, open_qty, int(safe_float(sell.get('multiplier'), 100)),
+            base_currency, usd_to_eur_rates
+        )
+        if components is None:
+            return
+        acc = current_zufluss_by_key.setdefault(key, {
+            'first_sell': sell,
+            'quantity': 0,
+            'premium_raw': 0.0,
+            'commission_raw': 0.0,
+            'premium_eur': 0.0,
+            'fx_weighted': 0.0,
+        })
+        acc['quantity'] += open_qty
+        acc['premium_raw'] += components['premium_raw']
+        acc['commission_raw'] += components['commission_raw']
+        acc['premium_eur'] += components['premium_eur']
+        acc['fx_weighted'] += components['fx_weighted']
+        sd = parse_date(sell.get('dateTime') or sell.get('tradeDate'))
+        first_sd = parse_date(acc['first_sell'].get('dateTime') or acc['first_sell'].get('tradeDate'))
+        if sd and (first_sd is None or sd < first_sd):
+            acc['first_sell'] = sell
 
-        # FIFO: älteste Sells werden zuerst durch closes (Rückkäufe + Assignments) verbraucht.
-        # Issue #40: Vorher gewichteter Durchschnitt über alle Sells — falsch bei
-        # Teilschließungen mit unterschiedlichen Preisen. Jetzt: nur die offenen Fills summieren.
-        sells_sorted = sorted(sells, key=lambda t: t.get('dateTime', '') or t.get('tradeDate', ''))
-        remaining_close = closed_qty
-
-        total_premium_raw = 0.0
-        total_commission = 0.0
-        total_premium_eur = 0.0
-        total_open_qty = 0
-        mult = int(safe_float(sells_sorted[0].get('multiplier'), 100))
-        fx_weighted = 0.0  # nur Display
-
-        for s in sells_sorted:
-            s_qty = abs(int(safe_float(s.get('quantity'))))
-            if s_qty <= 0:
-                continue
-            if remaining_close >= s_qty:
-                remaining_close -= s_qty
-                continue
-            open_qty = s_qty - remaining_close
-            remaining_close = 0
-
-            price = safe_float(s.get('tradePrice')) or safe_float(s.get('closePrice'))
-            if price <= 0:
-                continue
-            fx = safe_float(s.get('fxRateToBase'), 1.0)
-            comm = safe_float(s.get('ibCommission'), 0)
-            if open_qty < s_qty:
-                comm = comm * open_qty / s_qty
-
-            fill_brutto_raw = price * mult * open_qty
-            fill_net_raw = fill_brutto_raw + comm
-            if base_currency == 'EUR':
-                fill_eur = fill_net_raw * fx
-            else:
-                sd = parse_date(s.get('dateTime') or s.get('tradeDate'))
-                r_eur = get_rate_for_date(sd, usd_to_eur_rates) if sd else 1.0
-                fill_eur = fill_net_raw * fx * r_eur
-            total_premium_raw += fill_brutto_raw
-            total_commission += comm
-            total_premium_eur += fill_eur
-            fx_weighted += fx * open_qty
-            total_open_qty += open_qty
-
-        if total_open_qty == 0 or total_premium_raw == 0:
-            continue
-
-        # Keine Skalierung mehr — die Summe ist bereits exakt für die offene Menge
-        premium_raw = total_premium_raw
-        commission_raw = total_commission
-        net_premium_raw = premium_raw + commission_raw
-        premium_eur = total_premium_eur
-        fx_to_base = fx_weighted / total_open_qty if total_open_qty else 1.0  # nur Display
-
-        zufluss_premium_eur += premium_eur
-        zufluss_count += 1
-
-        sell_date = None
-        for s in sells_sorted:
-            sd = parse_date(s.get('dateTime') or s.get('tradeDate'))
-            if sd and (sell_date is None or sd < sell_date):
-                sell_date = sd
-
-        symbol = sells_sorted[0].get('symbol') or sells_sorted[0].get('description') or f"{key[1]} {key[2]} {key[3]} {key[4]}"
-        currency = sells_sorted[0].get('currency', '')
-        avg_price = total_premium_raw / (total_open_qty * mult) if (total_open_qty and mult) else 0
-        zufluss_details.append({
-            'symbol': symbol,
+    def _add_prior_zufluss_detail(key, sell, close_qty):
+        components = _premium_components_for_consumed_sell(
+            sell, close_qty, int(safe_float(sell.get('multiplier'), 100)),
+            base_currency, usd_to_eur_rates
+        )
+        if components is None:
+            return
+        prior_zufluss_details.append({
+            'symbol': sell.get('symbol') or sell.get('description') or f"{key[1]} {key[2]} {key[3]} {key[4]}",
             'underlyingSymbol': key[1],
             'strike': key[2],
             'expiry': key[3],
             'putCall': key[4],
-            'quantity': total_open_qty,
+            'quantity': close_qty,
+            'premium_eur': components['premium_eur'],
+            'premium_raw': components['net_premium_raw'],
+            'commission_raw': components['commission_raw'],
+            'fx_to_base': components['fx_weighted'] / close_qty if close_qty else 1.0,
+            'currency': sell.get('currency', ''),
+            'multiplier': int(safe_float(sell.get('multiplier'), 100)),
+            'avg_price': components['premium_raw'] / (
+                close_qty * int(safe_float(sell.get('multiplier'), 100))
+            ) if close_qty else 0,
+            'sell_date': str(parse_date(sell.get('dateTime') or sell.get('tradeDate'))) if parse_date(sell.get('dateTime') or sell.get('tradeDate')) else '',
+            'sell_year': parse_date(sell.get('dateTime') or sell.get('tradeDate')).year if parse_date(sell.get('dateTime') or sell.get('tradeDate')) else tax_year - 1,
+            'type': 'prior_year_correction',
+        })
+
+    # FIFO über die vollständige Series-Historie bis zum Steuerjahresende:
+    # aktuelle Rückkäufe verbrauchen zuerst noch offene Vorjahres-Sells. Dadurch
+    # werden aktuelle Sells nicht fälschlich als geschlossen behandelt und
+    # Vorjahresprämien nur für tatsächlich im Steuerjahr geschlossene Lots korrigiert.
+    for key, events in series_events.items():
+        open_lots = []
+        for ev in sorted(events, key=_option_sort_key):
+            ev_date = parse_date(ev.get('reportDate') or ev.get('dateTime') or ev.get('tradeDate'))
+            if not ev_date:
+                continue
+            if (ev.get('transactionType') == 'ExchTrade' and ev.get('buySell') == 'SELL'
+                    and abs(safe_float(ev.get('fifoPnlRealized'))) < 0.01):
+                qty = abs(int(safe_float(ev.get('quantity'))))
+                if qty > 0:
+                    open_lots.append({'trade': ev, 'remaining': qty})
+                continue
+
+            close_qty = abs(int(safe_float(ev.get('quantity'))))
+            if close_qty <= 0:
+                continue
+            is_buy_close = (ev.get('transactionType') == 'ExchTrade' and ev.get('buySell') == 'BUY'
+                            and abs(safe_float(ev.get('fifoPnlRealized'))) >= 0.01)
+            remaining_close = close_qty
+            for lot in open_lots:
+                if remaining_close <= 0:
+                    break
+                if lot['remaining'] <= 0:
+                    continue
+                take = min(lot['remaining'], remaining_close)
+                sell_date = parse_date(lot['trade'].get('reportDate') or lot['trade'].get('dateTime') or lot['trade'].get('tradeDate'))
+                if is_buy_close and ev_date.year == tax_year and sell_date and sell_date.year < tax_year:
+                    _add_prior_zufluss_detail(key, lot['trade'], take)
+                lot['remaining'] -= take
+                remaining_close -= take
+
+        for lot in open_lots:
+            if lot['remaining'] <= 0:
+                continue
+            sell_date = parse_date(lot['trade'].get('reportDate') or lot['trade'].get('dateTime') or lot['trade'].get('tradeDate'))
+            if sell_date and sell_date.year == tax_year:
+                _add_current_zufluss(key, lot['trade'], lot['remaining'])
+
+    for key, acc in current_zufluss_by_key.items():
+        if acc['quantity'] <= 0 or acc['premium_raw'] == 0:
+            continue
+        sell = acc['first_sell']
+        mult = int(safe_float(sell.get('multiplier'), 100))
+        net_premium_raw = acc['premium_raw'] + acc['commission_raw']
+        premium_eur = acc['premium_eur']
+        fx_to_base = acc['fx_weighted'] / acc['quantity'] if acc['quantity'] else 1.0
+        sell_date = parse_date(sell.get('dateTime') or sell.get('tradeDate'))
+
+        zufluss_premium_eur += premium_eur
+        zufluss_count += 1
+
+        zufluss_details.append({
+            'symbol': sell.get('symbol') or sell.get('description') or f"{key[1]} {key[2]} {key[3]} {key[4]}",
+            'underlyingSymbol': key[1],
+            'strike': key[2],
+            'expiry': key[3],
+            'putCall': key[4],
+            'quantity': acc['quantity'],
             'premium_eur': premium_eur,
             'premium_raw': net_premium_raw,
-            'commission_raw': commission_raw,
+            'commission_raw': acc['commission_raw'],
             'fx_to_base': fx_to_base,
-            'currency': currency,
+            'currency': sell.get('currency', ''),
             'multiplier': mult,
-            'avg_price': avg_price,
+            'avg_price': acc['premium_raw'] / (acc['quantity'] * mult) if (acc['quantity'] and mult) else 0,
             'sell_date': str(sell_date) if sell_date else '',
             'sell_year': sell_date.year if sell_date else tax_year,
             'type': 'sell_to_open',
@@ -1558,131 +1633,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     # prior-year premium — but that premium was already taxable in the selling year.
     # We subtract the premium to avoid double-counting.
 
-    prior_zufluss_correction_eur = 0.0
-    prior_zufluss_details = []
-
-    # Find prior-year SELL-to-open (PnL=0, year < tax_year)
-    prior_sell_opens = defaultdict(list)
-    for t in trades:
-        if t.get('assetCategory') not in ('OPT', 'FOP', 'FSFOP'):
-            continue
-        if t.get('transactionType') != 'ExchTrade' or t.get('buySell') != 'SELL':
-            continue
-        if abs(safe_float(t.get('fifoPnlRealized'))) >= 0.01:
-            continue
-        rd = parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))
-        if not rd or rd.year >= tax_year:
-            continue
-        key = (t.get('assetCategory'), t.get('underlyingSymbol', ''),
-               t.get('strike'), t.get('expiry'), t.get('putCall'))
-        prior_sell_opens[key].append(t)
-
-    if prior_sell_opens:
-        # Find matching current-year closes for these prior-year opens
-        for key, prior_sells in prior_sell_opens.items():
-            # Check if there's a closing BUY (Glattstellung) in tax_year
-            # EXCLUDE BookTrade BUYs (Assignments) — those are already handled
-            # by the assignment detection above and would cause double-counting
-            has_close = False
-            close_qty = 0
-            for t in trades:
-                if t.get('assetCategory') != key[0]:
-                    continue
-                if t.get('underlyingSymbol', '') != key[1]:
-                    continue
-                if t.get('strike') != key[2] or t.get('expiry') != key[3] or t.get('putCall') != key[4]:
-                    continue
-                rd = parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))
-                if not rd or rd.year != tax_year:
-                    continue
-                # Only ExchTrade BUY (Glattstellung), NOT BookTrade (Assignment)
-                if t.get('buySell') == 'BUY' and t.get('transactionType') == 'ExchTrade' and abs(safe_float(t.get('fifoPnlRealized'))) >= 0.01:
-                    close_qty += abs(int(safe_float(t.get('quantity'))))
-                    has_close = True
-
-            if not has_close:
-                continue
-
-            # FIFO: älteste Vorjahres-Sells werden zuerst durch aktuelle Rückkäufe verbraucht.
-            # Issue #52: Vorher gewichteter Durchschnitt über alle Sells — falsch bei
-            # ungleichen Vorjahres-Preisen. Jetzt: nur die tatsächlich verbrauchten Fills
-            # summieren (analog Issue #40 / Zufluss-Block). Steuerrechtlich korrekt laut
-            # BMF-Schreiben 14.05.2025 i.V.m. §11 EStG (Zuflussprinzip).
-            prior_sorted = sorted(prior_sells, key=lambda s: s.get('dateTime', '') or s.get('tradeDate', ''))
-            remaining_close = close_qty
-            total_premium_raw = 0.0
-            total_commission = 0.0
-            total_premium_eur = 0.0
-            consumed_qty = 0
-            mult = int(safe_float(prior_sorted[0].get('multiplier'), 100))
-            fx_weighted = 0.0  # nur Display
-            sell_date = None
-
-            for s in prior_sorted:
-                if remaining_close <= 0:
-                    break
-                s_qty = abs(int(safe_float(s.get('quantity'))))
-                if s_qty <= 0:
-                    continue
-                take = min(s_qty, remaining_close)
-                price = safe_float(s.get('tradePrice')) or safe_float(s.get('closePrice'))
-                if price <= 0:
-                    continue
-                fx = safe_float(s.get('fxRateToBase'), 1.0)
-                comm = safe_float(s.get('ibCommission'), 0)
-                if take < s_qty:
-                    comm = comm * take / s_qty
-                fill_brutto_raw = price * mult * take
-                fill_net_raw = fill_brutto_raw + comm
-                if base_currency == 'EUR':
-                    fill_eur = fill_net_raw * fx
-                else:
-                    sd_eur = parse_date(s.get('dateTime') or s.get('tradeDate'))
-                    r_eur = get_rate_for_date(sd_eur, usd_to_eur_rates) if sd_eur else 1.0
-                    fill_eur = fill_net_raw * fx * r_eur
-                total_premium_raw += fill_brutto_raw
-                total_commission += comm
-                total_premium_eur += fill_eur
-                fx_weighted += fx * take
-                consumed_qty += take
-                sd = parse_date(s.get('dateTime') or s.get('tradeDate'))
-                if sd and (sell_date is None or sd < sell_date):
-                    sell_date = sd
-                remaining_close -= take
-
-            if consumed_qty == 0 or total_premium_raw == 0:
-                continue
-
-            # Keine Skalierung — die Summe entspricht exakt der verbrauchten Menge
-            matched_qty = consumed_qty
-            premium_raw = total_premium_raw
-            commission_raw = total_commission
-            net_premium_raw = premium_raw + commission_raw
-            correction_eur = total_premium_eur
-            fx_to_base = fx_weighted / consumed_qty if consumed_qty else 1.0  # nur Display
-
-            prior_zufluss_correction_eur += correction_eur
-            symbol = prior_sorted[0].get('symbol') or prior_sorted[0].get('description') or f"{key[1]} {key[2]} {key[3]} {key[4]}"
-            currency = prior_sorted[0].get('currency', '')
-            avg_price = total_premium_raw / (consumed_qty * mult) if (consumed_qty and mult) else 0
-            prior_zufluss_details.append({
-                'symbol': symbol,
-                'underlyingSymbol': key[1],
-                'strike': key[2],
-                'expiry': key[3],
-                'putCall': key[4],
-                'quantity': matched_qty,
-                'premium_eur': correction_eur,
-                'premium_raw': net_premium_raw,
-                'commission_raw': commission_raw,
-                'fx_to_base': fx_to_base,
-                'currency': currency,
-                'multiplier': mult,
-                'avg_price': avg_price,
-                'sell_date': str(sell_date) if sell_date else '',
-                'sell_year': sell_date.year if sell_date else tax_year - 1,
-                'type': 'prior_year_correction',
-            })
+    prior_zufluss_correction_eur = sum(d['premium_eur'] for d in prior_zufluss_details)
 
     if prior_zufluss_correction_eur > 0:
         # Subtract prior-year premium from current PnL (already taxed in prior year)
@@ -1720,8 +1671,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
 
     # --- Fehlende Vorjahres-XMLs erkennen ---
     # BUY-close (Glattstellung/Verfall) ohne matching SELL-to-open = Vorjahr fehlt
-    # Collect all SELL-to-open keys (current year + prior years from history)
-    all_sell_open_keys = set(instr_sells.keys()) | set(prior_sell_opens.keys())
+    # all_sell_open_keys contains current-year and prior-year openings from history.
 
     zufluss_unmatched = []
     for t in trades:

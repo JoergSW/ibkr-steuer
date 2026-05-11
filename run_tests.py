@@ -150,6 +150,13 @@ def run_tests():
             expected = exp['expected'][field]
             if abs(actual - expected) > 0.01:
                 mismatches.append(f"{field}: erwartet {expected}, bekommen {actual}")
+        if 'cross_year_put_corrections_count' in exp['expected']:
+            actual = len(audit.get('cross_year_put_corrections', []) or [])
+            expected = exp['expected']['cross_year_put_corrections_count']
+            if actual != expected:
+                mismatches.append(
+                    f"cross_year_put_corrections_count: erwartet {expected}, bekommen {actual}"
+                )
         if missing_fields:
             print(f"  WARN  {name:20s} ({exp['description']}) — fehlende Felder in audit_expectations.json: {', '.join(missing_fields)}")
             print(f"        Hinweis: 'test_data/' ist gitignored. Nach Schema-Updates lokales JSON manuell ergaenzen.")

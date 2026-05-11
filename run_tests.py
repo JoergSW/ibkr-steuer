@@ -9,7 +9,7 @@ User in der UI sieht.
 Usage:
     python run_tests.py              # alle verfügbaren Szenarien
 """
-import json, os, sys, tempfile
+import json, os, shlex, sys, tempfile
 
 SCENARIOS = {
     "audit1_haupt": {
@@ -118,7 +118,7 @@ def run_tests():
         out_dir = tempfile.mkdtemp(prefix=f'test_{name}_')
         cmd = scenario['extract'].format(out=out_dir)
         if cmd.startswith("python "):
-            cmd = f"{sys.executable} {cmd[len('python '):]}"
+            cmd = f"{shlex.quote(sys.executable)} {cmd[len('python '):]}"
         os.system(f"{cmd} > /dev/null 2>&1")
 
         # Calculate (suppress stdout)
@@ -174,7 +174,7 @@ def run_tests():
     print(f"\n{'-'*60}")
     print("Synthetische Cross-Year-Series-Tests (Issues #61/#62)")
     sys.stdout.flush()
-    rc = os.system(f"{sys.executable} tests/test_cross_year_series.py")
+    rc = os.system(f"{shlex.quote(sys.executable)} tests/test_cross_year_series.py")
     if rc != 0:
         print("FAIL: Cross-Year-Series-Tests")
         sys.exit(1)

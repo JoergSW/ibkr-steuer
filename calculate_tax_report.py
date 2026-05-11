@@ -1784,6 +1784,23 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     _xy_tageskurs_lots = {}  # {symbol: list of {date_str, shares, premium_per_share_raw}}
     cross_year_put_corrections = []
     cross_year_put_total = 0.0
+    _xy_closed_share_remaining = None
+    _xy_closed_path = os.path.join(ib_tax_dir, 'closed_lots.csv')
+    if os.path.exists(_xy_closed_path):
+        _xy_closed_share_remaining = {}
+        for lot in load_csv(_xy_closed_path):
+            if lot.get('assetCategory') != 'STK':
+                continue
+            report_date = parse_date(lot.get('reportDate') or lot.get('dateTime'))
+            if not report_date or report_date.year != tax_year:
+                continue
+            sym = (lot.get('underlyingSymbol') or lot.get('symbol', '')).split()[0]
+            open_date = (lot.get('openDateTime') or '')[:10]
+            qty = abs(safe_float(lot.get('quantity'), 0))
+            if not sym or not open_date or qty <= 0:
+                continue
+            key = (sym, open_date)
+            _xy_closed_share_remaining[key] = _xy_closed_share_remaining.get(key, 0) + qty
 
     # Issue #54: Bei mehreren Andienungen derselben Series werden die Original-Sells
     # FIFO konsumiert (aelteste zuerst), nicht als Durchschnitt verteilt. State pro
@@ -1836,13 +1853,35 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             continue
 
         net_premium_raw = premium_raw + commission_raw
-        shares = consumed_qty * mult
+        assignment_shares = consumed_qty * mult
         fx_to_base = fx_weighted / consumed_qty if consumed_qty else 1.0  # nur Display
 
-        premium_per_share_eur = premium_eur / shares if shares else 0
+        premium_per_share_eur = premium_eur / assignment_shares if assignment_shares else 0
         a_date = parse_date(a.get('reportDate') or a.get('dateTime') or a.get('tradeDate'))
 
-        premium_per_share_raw = net_premium_raw / shares if shares else 0
+        premium_per_share_raw = net_premium_raw / assignment_shares if assignment_shares else 0
+        lot_open_dates = [
+            ((a.get('dateTime') or a.get('tradeDate') or '')[:10]),
+            ((a.get('reportDate') or '')[:10]),
+        ]
+        lot_open_dates = [d for i, d in enumerate(lot_open_dates) if d and d not in lot_open_dates[:i]]
+        matched_open_date = lot_open_dates[0] if lot_open_dates else ''
+        shares = assignment_shares
+        if _xy_closed_share_remaining is not None:
+            closed_key = None
+            closed_shares = 0
+            for candidate_date in lot_open_dates:
+                candidate_key = (underlying, candidate_date)
+                candidate_shares = _xy_closed_share_remaining.get(candidate_key, 0)
+                if candidate_shares > 0:
+                    closed_key = candidate_key
+                    closed_shares = candidate_shares
+                    matched_open_date = candidate_date
+                    break
+            if closed_shares <= 0:
+                continue
+            shares = min(assignment_shares, closed_shares)
+            _xy_closed_share_remaining[closed_key] = closed_shares - shares
         if underlying not in put_assignment_lots:
             put_assignment_lots[underlying] = deque()
         put_assignment_lots[underlying].append({
@@ -1855,13 +1894,11 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         })
         # Issue #55: Snapshot fuer _tageskurs_put_adj — bleibt erhalten auch wenn
         # put_assignment_lots durch Apply-Schleife geleert wird.
-        # WICHTIG: date_str MUSS dateTime/tradeDate sein (Trade-Datum), nicht
-        # reportDate (Settlement). closed_lots.openDateTime[:10] matcht das
-        # Trade-Datum — bei OpEx-Friday-Andienungen liegt reportDate auf Mo,
-        # was den Match brechen wuerde. put_assignment_lots.date bleibt
-        # unveraendert (reportDate-bevorzugt) fuer Sortier-Zwecke.
+        # date_str nutzt das tatsaechlich in closed_lots gematchte Open-Datum.
+        # IBKR kann bei Andienungen je nach Buchung tradeDate oder reportDate
+        # als openDateTime fuehren.
         _xy_tageskurs_lots.setdefault(underlying, []).append({
-            'date_str': (a.get('dateTime') or a.get('tradeDate') or '')[:10],
+            'date_str': matched_open_date,
             'shares': shares,
             'premium_per_share_raw': premium_per_share_raw,
         })

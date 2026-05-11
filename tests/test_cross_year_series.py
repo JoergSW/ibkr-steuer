@@ -569,6 +569,119 @@ def test_same_day_put_assignment_does_not_double_correct_strike_basis():
     print(f"    Kostenbasis bleibt {stock_rows[0]['cost']:.2f} USD")
 
 
+def test_prior_year_put_lot_sold_before_tax_year_does_not_touch_current_sale():
+    """TC10: History-lot from prior year must not leak into an unrelated 2025 sale."""
+    prior_year_trades = [
+        make_sell("2024-03-01", 1, 2.00, strike="70", expiry="2024-03-15",
+                  pc="P", underlying="MU", commission=-1.0),
+        make_assignment("2024-03-15", 1, strike="70", expiry="2024-03-15",
+                        pc="P", underlying="MU"),
+        {
+            "tradeID": "mu_2024_stock_sale",
+            "assetCategory": "STK",
+            "transactionType": "ExchTrade",
+            "buySell": "SELL",
+            "openCloseIndicator": "C",
+            "underlyingSymbol": "MU",
+            "symbol": "MU",
+            "description": "MICRON TECHNOLOGY INC",
+            "quantity": "-100",
+            "tradePrice": "75",
+            "closePrice": "75",
+            "ibCommission": "0",
+            "fxRateToBase": "1.0",
+            "currency": "USD",
+            "dateTime": "2024-04-01 10:00:00",
+            "tradeDate": "2024-04-01",
+            "reportDate": "2024-04-01",
+            "fifoPnlRealized": "500",
+            "cost": "7000",
+            "proceeds": "7500",
+            "isin": "US5951121038",
+        },
+    ]
+    trades = prior_year_trades + _mu_put_assignment_trade_set(
+        8400.0, 3236.98, assignment_datetime="2025-04-25 16:20:00",
+        stock_book_cost=8400.0
+    )
+    rd = calculate_for_trades(
+        trades,
+        tax_year=2025,
+        closed_lots=_mu_closed_lot(8400.0),
+        conversion_rates=[
+            {"reportDate": "2025-04-25", "fromCurrency": "USD", "toCurrency": "EUR", "rate": "0.87998"},
+            {"reportDate": "2025-06-11", "fromCurrency": "USD", "toCurrency": "EUR", "rate": "0.87050"},
+        ],
+    )
+    stock_rows = [r for r in rd["trade_details"] if r.get("symbol") == "MU" and r.get("source") == "trades"]
+    assert len(stock_rows) == 1, f"erwartet 1 MU-Aktienzeile, aktuell {len(stock_rows)}"
+    assert_close(stock_rows[0]["cost"], 8400.0, label="TC10 stock cost")
+    assert_close(stock_rows[0]["fifoPnlRealized"], 3236.98, label="TC10 stock pnl raw")
+    assert not rd["audit"].get("cross_year_put_corrections"), \
+        f"unerwartete Cross-Year-Korrektur: {rd['audit'].get('cross_year_put_corrections')}"
+
+    print("  TC10 Verkaufte Vorjahres-Andienung leakt nicht in 2025-MU-Verkauf: OK")
+    print(f"    Kostenbasis bleibt {stock_rows[0]['cost']:.2f} USD")
+
+
+def test_prior_year_put_lot_sold_in_tax_year_is_still_corrected():
+    """TC11: Matching CLOSED_LOT open date still allows real cross-year correction."""
+    trades = [
+        make_sell("2024-03-01", 1, 2.00, strike="70", expiry="2024-03-15",
+                  pc="P", underlying="MU", commission=-1.0),
+        make_assignment("2024-03-15", 1, strike="70", expiry="2024-03-15",
+                        pc="P", underlying="MU"),
+        {
+            "tradeID": "mu_2025_sale_prior_lot",
+            "assetCategory": "STK",
+            "transactionType": "ExchTrade",
+            "buySell": "SELL",
+            "openCloseIndicator": "C",
+            "underlyingSymbol": "MU",
+            "symbol": "MU",
+            "description": "MICRON TECHNOLOGY INC",
+            "quantity": "-100",
+            "tradePrice": "80",
+            "closePrice": "80",
+            "ibCommission": "0",
+            "fxRateToBase": "1.0",
+            "currency": "USD",
+            "dateTime": "2025-02-01 10:00:00",
+            "tradeDate": "2025-02-01",
+            "reportDate": "2025-02-01",
+            "fifoPnlRealized": "1199",
+            "cost": "6801",
+            "proceeds": "8000",
+            "isin": "US5951121038",
+        },
+    ]
+    closed_lots = [{
+        "assetCategory": "STK",
+        "currency": "USD",
+        "reportDate": "2025-02-01",
+        "dateTime": "2025-02-01 10:00:00",
+        "openDateTime": "2024-03-15 16:20:00",
+        "quantity": "100",
+        "cost": "6801",
+        "fifoPnlRealized": "1199",
+        "fxRateToBase": "1.0",
+        "symbol": "MU",
+        "description": "MICRON TECHNOLOGY INC",
+        "isin": "US5951121038",
+        "underlyingSymbol": "MU",
+    }]
+    rd = calculate_for_trades(trades, tax_year=2025, closed_lots=closed_lots)
+    stock_rows = [r for r in rd["trade_details"] if r.get("symbol") == "MU" and r.get("source") == "trades"]
+    assert len(stock_rows) == 1, f"erwartet 1 MU-Aktienzeile, aktuell {len(stock_rows)}"
+    assert_close(stock_rows[0]["cost"], 7000.0, label="TC11 stock cost")
+    assert_close(stock_rows[0]["fifoPnlRealized"], 1000.0, label="TC11 stock pnl raw")
+    assert len(rd["audit"].get("cross_year_put_corrections", [])) == 1, \
+        f"erwartet 1 Cross-Year-Korrektur, aktuell {rd['audit'].get('cross_year_put_corrections')}"
+
+    print("  TC11 Echte Cross-Year-Andienung mit CLOSED_LOT-Match bleibt korrigiert: OK")
+    print(f"    Kostenbasis {stock_rows[0]['cost']:.2f} USD")
+
+
 if __name__ == "__main__":
     test_cross_year_put_series()
     test_cross_year_call_series()
@@ -579,4 +692,6 @@ if __name__ == "__main__":
     test_put_assignment_does_not_double_correct_strike_basis()
     test_put_assignment_corrects_reduced_cost_basis()
     test_same_day_put_assignment_does_not_double_correct_strike_basis()
-    print("\nOK: alle 9 TCs gruen")
+    test_prior_year_put_lot_sold_before_tax_year_does_not_touch_current_sale()
+    test_prior_year_put_lot_sold_in_tax_year_is_still_corrected()
+    print("\nOK: alle 11 TCs gruen")

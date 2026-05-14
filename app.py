@@ -302,6 +302,7 @@ def classify_xmls(xml_files):
     Latest XML per account = tax year, older = history."""
     import xml.etree.ElementTree as ET
     accounts = {}
+    multi_stmt_files = []
     for xml_file in xml_files:
         try:
             content = xml_file.getvalue()
@@ -310,6 +311,14 @@ def classify_xmls(xml_files):
             acct = root.find('.//AccountInformation')
             if stmt is None:
                 continue
+            # Only the first FlexStatement is processed downstream — flag
+            # exports that bundle several accounts so the user is warned.
+            all_stmts = root.findall('.//FlexStatement')
+            if len(all_stmts) > 1:
+                multi_stmt_files.append({
+                    'name': xml_file.name,
+                    'account_ids': [s.get('accountId', '?') for s in all_stmts],
+                })
             account_id = stmt.get('accountId', 'unknown')
             entry = {
                 'file': xml_file,
@@ -341,7 +350,7 @@ def classify_xmls(xml_files):
             if len(years) == 1:
                 for x in xmls:
                     x['is_quarterly'] = True
-    return accounts
+    return accounts, multi_stmt_files
 
 def merge_report_data(reports):
     """Merge multiple report_data dicts (one per account) by summing numeric fields."""
@@ -628,9 +637,18 @@ if not uploaded_xml_files:
 
 # ── Classify XMLs by account ────────────────────────────────────────────────
 
-accounts = classify_xmls(uploaded_xml_files)
+accounts, multi_stmt_files = classify_xmls(uploaded_xml_files)
 if not accounts:
     st.stop()
+
+if multi_stmt_files:
+    for f in multi_stmt_files:
+        st.warning(
+            f"**{f['name']}** enthält {len(f['account_ids'])} Konten "
+            f"({', '.join(f['account_ids'])}). Es wird nur das erste Konto "
+            f"(**{f['account_ids'][0]}**) verarbeitet — die übrigen werden ignoriert. "
+            f"Bitte pro Konto eine eigene Flex Query erstellen und einzeln hochladen."
+        )
 
 # Determine global tax year from latest XML across all accounts
 all_to_dates = [xml['to_date'] for xmls in accounts.values() for xml in xmls]

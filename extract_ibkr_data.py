@@ -561,6 +561,16 @@ def parse_ibkr_xml(xml_file_path, output_dir):
         print(f"Error parsing XML: {e}")
         return
 
+    # Multi-account check: the parser only reads the first FlexStatement
+    # (root.find(...) returns the first match). Warn loudly if the export
+    # bundles several accounts — otherwise the rest are silently dropped.
+    flex_statements = root.findall('.//FlexStatement')
+    if len(flex_statements) > 1:
+        acct_ids = [s.get('accountId', '?') for s in flex_statements]
+        print(f"WARNUNG: XML enthaelt {len(flex_statements)} Konten ({', '.join(acct_ids)}). "
+              f"Es wird NUR das erste Konto ({acct_ids[0]}) verarbeitet. "
+              f"Bitte pro Konto eine eigene Flex Query erstellen.")
+
     # Define sections to extract
     # Mapping: XML Tag -> Output Filename
     sections = {

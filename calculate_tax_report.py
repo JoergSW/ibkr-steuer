@@ -1744,7 +1744,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             report_date = parse_date(lot.get('reportDate') or lot.get('dateTime'))
             if not report_date or report_date.year != tax_year:
                 continue
-            sym = (lot.get('underlyingSymbol') or lot.get('symbol', '')).split()[0]
+            # Key-Ableitung identisch zum trades-Loop und put_assignment_lots:
+            # underlyingSymbol NICHT splitten (Klassen-Aktien wie 'BRK B'),
+            # nur der symbol-Fallback wird gesplittet.
+            sym = lot.get('underlyingSymbol') or lot.get('symbol', '').split()[0]
             open_date = (lot.get('openDateTime') or '')[:10]
             qty = abs(safe_float(lot.get('quantity'), 0))
             if not sym or not open_date or qty <= 0:
@@ -1867,8 +1870,6 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             put_assignment_lots[sym] = deque(sorted(put_assignment_lots[sym], key=lambda x: x['date'] or ''))
 
         cross_year_put_total = 0.0
-        # Track per-trade correction groups for proper gain/loss split (Issue #23)
-        _trade_corr_groups = []
 
         for t in trades:
             report_date = parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))
@@ -1886,34 +1887,21 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             if sym not in put_assignment_lots:
                 continue
 
-            # Calculate pnl_eur for this trade (same logic as main loop)
-            # to determine whether the trade's PnL went to gain or loss pool
-            pnl_raw = float(pnl_str)
-            fx_to_base = safe_float(t.get('fxRateToBase'), 1.0)
-            t_date = parse_date(t.get('dateTime') or t.get('tradeDate'))
-            if base_currency == 'EUR':
-                trade_pnl_eur = pnl_raw * fx_to_base
-            else:
-                pnl_usd = pnl_raw * fx_to_base
-                rate_eur = get_rate_for_date(t_date, usd_to_eur_rates)
-                trade_pnl_eur = pnl_usd * rate_eur
-
             sell_qty = abs(int(safe_float(t.get('quantity'))))
             remaining = sell_qty
-            trade_corr_total = 0.0
 
             while remaining > 0 and put_assignment_lots[sym]:
                 lot = put_assignment_lots[sym][0]
                 consumed = min(remaining, lot['shares_remaining'])
-                correction = consumed * lot['premium_per_share_eur']
-                cross_year_put_total += correction
-                trade_corr_total += correction
+                # correction_eur wird erst in der debug_rows-Schleife unten gesetzt:
+                # der tatsaechliche EUR-Betrag haengt vom FX-Kurs des Aktienverkaufs
+                # ab, nicht vom Options-Verkaufskurs (premium_per_share_eur).
                 cross_year_put_corrections.append({
                     'symbol': sym,
                     'shares': consumed,
                     'premium_per_share': lot['premium_per_share_eur'],
                     'premium_per_share_raw': lot['premium_per_share_raw'],
-                    'correction_eur': correction,
+                    'correction_eur': 0.0,
                     'assignment_year': lot['year'],
                     'strike': lot['strike'],
                 })
@@ -1922,107 +1910,59 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 if lot['shares_remaining'] <= 0:
                     put_assignment_lots[sym].popleft()
 
-            if trade_corr_total > 0:
-                underlying_isin = symbol_to_isin.get(sym, '')
-                _cls_xy = _effective_classification(underlying_isin) if underlying_isin else None
-                is_so = bool(underlying_isin and underlying_isin in etf_isins and _cls_xy == 'anlage_so')
-                is_etf = bool(underlying_isin and underlying_isin in etf_isins
-                              and _cls_xy not in ('no_invstg', 'anlage_so'))
-                is_no_invstg = bool(underlying_isin and underlying_isin in etf_isins
-                                    and _cls_xy == 'no_invstg')
-                _trade_corr_groups.append({
-                    'pnl_eur': trade_pnl_eur,
-                    'total_corr': trade_corr_total,
-                    'is_etf': is_etf,
-                    'is_so': is_so,
-                    'is_no_invstg': is_no_invstg,
-                    'isin': underlying_isin if (is_etf or is_so) else '',
-                })
-
-        if cross_year_put_total > 0:
-            # Split correction properly between gain and loss pools per trade (Issue #23)
-            # A correction reduces the trade's PnL. If the trade had positive PnL (in gain pool),
-            # the correction first reduces gain; any excess becomes additional loss.
-            # If the trade had negative PnL (in loss pool), the full correction increases the loss.
+        if cross_year_put_corrections:
+            # Correct stock debug_rows in-place AND derive the pool adjustment from the
+            # actual per-row EUR delta — exact same pattern as the same-year
+            # pending_stk_corrections block (Issue #23). Earlier this block subtracted
+            # premium_per_share_eur (premium at the option-sell FX rate) from stocks_gain
+            # while the debug_row used premium_per_share_raw × fx_stock_sale. With a
+            # cross-year put those FX rates differ, so the Topf-1 saldo (GUI) drifted away
+            # from the Trade-Details sum (Excel). Deriving the pool adjustment from
+            # correction_eur = original_pnl_eur − row['pnl_eur'] keeps them identical.
+            # IBKR cost = strike×qty − premium (embedded). Restore to strike×qty.
             stk_gain_corr = 0.0
             stk_loss_corr = 0.0
             etf_gain_corr = 0.0
             etf_loss_corr = 0.0
             nv_gain_corr = 0.0  # no_invstg ETP correction → Topf 2
             nv_loss_corr = 0.0
+            _etf_by_isin_corr_xy = {}
 
-            for g in _trade_corr_groups:
-                pnl = g['pnl_eur']
-                corr = g['total_corr']
-                if pnl > 0:
-                    from_gain = min(corr, pnl)
-                    from_loss = corr - from_gain
-                else:
-                    from_gain = 0.0
-                    from_loss = corr
-
-                if g.get('is_so'):
-                    # Anlage-SO-Override (Issue #51): Keine Aggregation auf stocks_gain.
-                    # Korrektur läuft per Lot im Anlage-SO-Build via _so_premium_lookup.
-                    pass
-                elif g['is_etf']:
-                    etf_gain_corr += from_gain
-                    etf_loss_corr += from_loss
-                    if g['isin'] in etf_by_isin:
-                        etf_by_isin[g['isin']]['gain'] -= from_gain
-                        etf_by_isin[g['isin']]['loss'] -= from_loss
-                elif g.get('is_no_invstg'):
-                    # no_invstg-ETP (GLD, IBIT, BSOL, …): Trade-PnL lief bereits
-                    # in options_gain/loss (Topf 2). Die Prämie wurde schon im
-                    # Vorjahr als Stillhaltereinkünfte versteuert → hier aus Topf 2
-                    # raus, damit sie nicht ein zweites Mal erfasst wird.
-                    nv_gain_corr += from_gain
-                    nv_loss_corr += from_loss
-                else:
-                    stk_gain_corr += from_gain
-                    stk_loss_corr += from_loss
-
-            stocks_gain -= stk_gain_corr
-            stocks_loss -= stk_loss_corr
-            etf_invstg_gain -= etf_gain_corr
-            etf_invstg_loss -= etf_loss_corr
-            options_gain -= nv_gain_corr
-            options_loss -= nv_loss_corr
-            # Shadow-Tracking synchron halten (analog current-year, s. dortigen Kommentar).
-            no_invstg_gain -= nv_gain_corr
-            no_invstg_loss -= nv_loss_corr
-            if 'Crypto/Commodity ETPs' in topf2_by_category:
-                topf2_by_category['Crypto/Commodity ETPs']['gain'] -= nv_gain_corr
-                topf2_by_category['Crypto/Commodity ETPs']['loss'] -= nv_loss_corr
-            # NOT options_gain += ... (premium was already taxed in the assignment year)
-            print(f"Cross-Year Put-Korrektur: {len(cross_year_put_corrections)} Positionen, "
-                  f"{cross_year_put_total:,.2f} EUR von PnL abgezogen (Prämie bereits in Vorjahr versteuert).")
-
-            # Correct stock debug_rows in-place (same pattern as pending_stk_corrections)
-            # Instead of separate correction rows, fix cost/PnL directly on the stock row.
-            # IBKR cost = strike×qty − premium (embedded). Restore to strike×qty.
-            _xy_pending = {}  # {symbol: [{premium_per_share_raw, remaining_shares}]}
+            _xy_pending = {}  # {symbol: [{premium_per_share_raw, remaining_shares, corr_ref}]}
             for c in cross_year_put_corrections:
                 _xy_pending.setdefault(c['symbol'], []).append({
                     'premium_per_share_raw': c['premium_per_share_raw'],
                     'remaining_shares': c['shares'],
+                    'corr_ref': c,
                 })
             for row in debug_rows:
                 if row.get('source') != 'trades' or row.get('assetCategory') != 'STK':
                     continue
-                row_symbol = (row.get('underlyingSymbol') or row.get('symbol', '')).split()[0]
+                # Die Korrekturen stammen ausschliesslich aus STK-SELL-Trades
+                # (s. trades-Loop oben) — nur SELL-Rows duerfen sie konsumieren,
+                # sonst greift z.B. ein Short-Cover-BUY desselben Symbols sie ab.
+                if row.get('buySell') != 'SELL':
+                    continue
+                # Key-Ableitung identisch zum trades-Loop (sym) und put_assignment_lots:
+                # underlyingSymbol NICHT splitten, sonst verfehlt 'BRK B' den
+                # _xy_pending-Eintrag und die Korrektur bleibt stumm bei 0.
+                row_symbol = row.get('underlyingSymbol') or row.get('symbol', '').split()[0]
                 if not row_symbol or row_symbol not in _xy_pending:
                     continue
                 qty = abs(safe_float(row.get('quantity', '0'), 0))
                 if qty == 0:
                     continue
+                original_pnl_eur = row['pnl_eur']
                 total_correction_raw = 0.0
                 remaining = qty
+                _row_corr_refs = []  # [(cross_year_put_corrections-Eintrag, chunk_raw)]
                 for corr in _xy_pending[row_symbol]:
                     if corr['remaining_shares'] <= 0:
                         continue
                     consumed = min(remaining, corr['remaining_shares'])
-                    total_correction_raw += consumed * corr['premium_per_share_raw']
+                    chunk_raw = consumed * corr['premium_per_share_raw']
+                    total_correction_raw += chunk_raw
+                    _row_corr_refs.append((corr['corr_ref'], chunk_raw))
                     corr['remaining_shares'] -= consumed
                     remaining -= consumed
                     if remaining <= 0:
@@ -2041,6 +1981,71 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                         r_eur = get_rate_for_date(d, usd_to_eur_rates)
                         row['pnl_eur'] = round(row['fifoPnlRealized'] * fx * r_eur, 5)
                     row['stillhalter_adjusted'] = True
+
+                    # Pool-Anpassung aus dem tatsächlichen Row-Delta ableiten
+                    # (gain/loss-Split-Logik identisch zum Same-Year-Block).
+                    correction_eur = original_pnl_eur - row['pnl_eur']
+                    # Tatsaechlichen EUR-Korrekturbetrag (stock_fx) anteilig auf die
+                    # konsumierten cross_year_put_corrections-Eintraege verteilen, damit
+                    # Box-Gesamt, Einzelzeilen, Pool-Reduktion und Plausibilitaetscheck-
+                    # Add-Back exakt dieselbe Basis haben (Codex P2).
+                    for _ref, _chunk_raw in _row_corr_refs:
+                        _ref['correction_eur'] += correction_eur * (
+                            _chunk_raw / total_correction_raw)
+                    row_isin = row.get('isin', '')
+                    _row_cls = _effective_classification(row_isin) if row_isin else None
+                    is_so = bool(row_isin and row_isin in etf_isins and _row_cls == 'anlage_so')
+                    is_etf = bool(row_isin and row_isin in etf_isins
+                                  and _row_cls not in ('no_invstg', 'anlage_so'))
+                    if original_pnl_eur > 0:
+                        from_gain = min(correction_eur, original_pnl_eur)
+                        from_loss = correction_eur - from_gain
+                    else:
+                        from_gain = 0.0
+                        from_loss = correction_eur
+                    if is_so:
+                        # Anlage-SO-Override (Issue #51): Keine Aggregation auf
+                        # stocks/ETF-Pools. Korrektur läuft per Lot im Anlage-SO-Build.
+                        pass
+                    elif is_etf:
+                        etf_gain_corr += from_gain
+                        etf_loss_corr += from_loss
+                        if row_isin not in _etf_by_isin_corr_xy:
+                            _etf_by_isin_corr_xy[row_isin] = {'gain': 0.0, 'loss': 0.0}
+                        _etf_by_isin_corr_xy[row_isin]['gain'] += from_gain
+                        _etf_by_isin_corr_xy[row_isin]['loss'] += from_loss
+                    elif _row_cls == 'no_invstg':
+                        nv_gain_corr += from_gain
+                        nv_loss_corr += from_loss
+                    else:
+                        stk_gain_corr += from_gain
+                        stk_loss_corr += from_loss
+
+            # NOT options_gain += ... (premium was already taxed in the assignment year)
+            stocks_gain -= stk_gain_corr
+            stocks_loss -= stk_loss_corr
+            etf_invstg_gain -= etf_gain_corr
+            etf_invstg_loss -= etf_loss_corr
+            options_gain -= nv_gain_corr
+            options_loss -= nv_loss_corr
+            # Shadow-Tracking synchron halten (analog current-year, s. dortigen Kommentar).
+            no_invstg_gain -= nv_gain_corr
+            no_invstg_loss -= nv_loss_corr
+            if 'Crypto/Commodity ETPs' in topf2_by_category:
+                topf2_by_category['Crypto/Commodity ETPs']['gain'] -= nv_gain_corr
+                topf2_by_category['Crypto/Commodity ETPs']['loss'] -= nv_loss_corr
+            for _isin, _adj in _etf_by_isin_corr_xy.items():
+                if _isin in etf_by_isin:
+                    etf_by_isin[_isin]['gain'] -= _adj['gain']
+                    etf_by_isin[_isin]['loss'] -= _adj['loss']
+
+            # cross_year_put_total = tatsaechlich von den Pools subtrahierter Betrag
+            # (stock_fx) — NICHT die Praemie zum Options-Verkaufskurs. app.py nutzt
+            # diesen Wert fuer die Cross-Year-Put-Box und den Plausibilitaetscheck-
+            # Add-Back; beide muessen exakt der Pool-/Trade-Details-Korrektur entsprechen.
+            cross_year_put_total = sum(c['correction_eur'] for c in cross_year_put_corrections)
+            print(f"Cross-Year Put-Korrektur: {len(cross_year_put_corrections)} Positionen, "
+                  f"{cross_year_put_total:,.2f} EUR von PnL abgezogen (Prämie bereits in Vorjahr versteuert).")
 
     # Zuflussprinzip: cross-year premium aggregation
     # Combines three sources:

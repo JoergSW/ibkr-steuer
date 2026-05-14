@@ -777,6 +777,264 @@ def test_zufluss_fifo_prior_close_consumes_prior_sell_before_tax_year():
     print("    keine falsche Vorjahreskorrektur in 2025")
 
 
+def test_cross_year_put_topf1_consistent_across_fx_rates():
+    """TC15: Topf-1-Saldo (Website) muss der Summe der Topf-1-Trade-Details (Excel) entsprechen.
+
+    Cross-Year-Put: Option im Vorjahr verkauft (FX 0.90), Aktie im Steuerjahr
+    verkauft (FX 0.80). Der Backend reduziert stocks_gain mit premium_per_share_eur
+    (= Praemie zum Options-Verkaufskurs), die debug_row aber mit
+    premium_per_share_raw x fx_aktienverkauf. Bei abweichenden FX-Kursen klaffen
+    topf_1_aktien_netto und die Summe der Topf-1-Zeilen auseinander.
+    """
+    sell = make_sell("2024-03-01", 1, 2.00, strike="70", expiry="2024-03-15",
+                     pc="P", underlying="MU", commission=-1.0)
+    sell["fxRateToBase"] = "0.90"
+    sell["currency"] = "USD"
+    trades = [
+        sell,
+        make_assignment("2024-03-15", 1, strike="70", expiry="2024-03-15",
+                        pc="P", underlying="MU"),
+        {
+            "tradeID": "mu_2025_sale_prior_lot",
+            "assetCategory": "STK",
+            "transactionType": "ExchTrade",
+            "buySell": "SELL",
+            "openCloseIndicator": "C",
+            "underlyingSymbol": "MU",
+            "symbol": "MU",
+            "description": "MICRON TECHNOLOGY INC",
+            "quantity": "-100",
+            "tradePrice": "80",
+            "closePrice": "80",
+            "ibCommission": "0",
+            "fxRateToBase": "0.80",
+            "currency": "USD",
+            "dateTime": "2025-02-01 10:00:00",
+            "tradeDate": "2025-02-01",
+            "reportDate": "2025-02-01",
+            "fifoPnlRealized": "1199",
+            "cost": "6801",
+            "proceeds": "8000",
+            "isin": "US5951121038",
+        },
+    ]
+    closed_lots = [{
+        "assetCategory": "STK",
+        "currency": "USD",
+        "reportDate": "2025-02-01",
+        "dateTime": "2025-02-01 10:00:00",
+        "openDateTime": "2024-03-15 16:20:00",
+        "quantity": "100",
+        "cost": "6801",
+        "fifoPnlRealized": "1199",
+        "fxRateToBase": "0.80",
+        "symbol": "MU",
+        "description": "MICRON TECHNOLOGY INC",
+        "isin": "US5951121038",
+        "underlyingSymbol": "MU",
+    }]
+    rd = calculate_for_trades(trades, tax_year=2025, closed_lots=closed_lots)
+
+    assert len(rd["audit"].get("cross_year_put_corrections", [])) == 1, \
+        f"erwartet 1 Cross-Year-Korrektur, aktuell {rd['audit'].get('cross_year_put_corrections')}"
+
+    topf_1 = rd["topf_1_aktien_netto"]
+    topf1_rows_sum = sum(
+        r.get("pnl_eur", 0) for r in rd["trade_details"] if r.get("topf") == "Topf1"
+    )
+
+    # IBKR-Rohwert 1199 USD, Praemie 199 USD raus -> 1000 USD x 0.80 = 800.00 EUR
+    assert_close(topf1_rows_sum, 800.0, label="TC15 Topf-1 Trade-Details Summe")
+    assert_close(topf_1, 800.0, label="TC15 topf_1_aktien_netto")
+    assert_close(topf_1, topf1_rows_sum, label="TC15 Topf-1 Website vs Excel")
+
+    # Audit-Werte (Box + Plausibilitaetscheck) muessen den tatsaechlich
+    # subtrahierten Betrag tragen (stock_fx), nicht die Praemie zum Options-Kurs.
+    # Reduktion = 1199 x 0.80 - 1000 x 0.80 = 199 x 0.80 = 159.20 EUR.
+    audit = rd["audit"]
+    assert_close(audit["cross_year_put_total"], 159.2, label="TC15 cross_year_put_total")
+    cyp = audit["cross_year_put_corrections"]
+    assert_close(sum(c["correction_eur"] for c in cyp), 159.2,
+                 label="TC15 Summe correction_eur")
+
+    print("  TC15 Cross-Year-Put Topf-1 konsistent ueber FX-Kurse: OK")
+    print(f"    topf_1_aktien_netto = {topf_1:.2f} EUR, Trade-Details-Summe = {topf1_rows_sum:.2f} EUR")
+    print(f"    cross_year_put_total = {audit['cross_year_put_total']:.2f} EUR (tatsaechlich subtrahiert)")
+
+
+def test_cross_year_put_correction_only_hits_sell_rows():
+    """TC16: Cross-Year-Put-Korrektur darf nur den Aktien-VERKAUF treffen.
+
+    Die Korrekturen werden ausschliesslich aus STK-SELL-Trades gebaut. Liegt im
+    Steuerjahr zusaetzlich ein STK-BUY desselben Symbols (z.B. Short-Cover) und
+    steht der vor dem SELL in debug_rows, darf er die Korrektur nicht abgreifen.
+    """
+    sell_opt = make_sell("2024-03-01", 1, 2.00, strike="70", expiry="2024-03-15",
+                         pc="P", underlying="MU", commission=-1.0)
+    sell_opt["currency"] = "USD"
+    stk_buy = {
+        "tradeID": "mu_2025_short_cover",
+        "assetCategory": "STK",
+        "transactionType": "ExchTrade",
+        "buySell": "BUY",
+        "openCloseIndicator": "C",
+        "underlyingSymbol": "MU",
+        "symbol": "MU",
+        "description": "MICRON TECHNOLOGY INC",
+        "quantity": "100",
+        "tradePrice": "60",
+        "closePrice": "60",
+        "ibCommission": "0",
+        "fxRateToBase": "1.0",
+        "currency": "USD",
+        "dateTime": "2025-01-05 10:00:00",
+        "tradeDate": "2025-01-05",
+        "reportDate": "2025-01-05",
+        "fifoPnlRealized": "300",
+        "cost": "-6300",
+        "proceeds": "6000",
+        "isin": "US5951121038",
+    }
+    stk_sell = {
+        "tradeID": "mu_2025_sale_prior_lot",
+        "assetCategory": "STK",
+        "transactionType": "ExchTrade",
+        "buySell": "SELL",
+        "openCloseIndicator": "C",
+        "underlyingSymbol": "MU",
+        "symbol": "MU",
+        "description": "MICRON TECHNOLOGY INC",
+        "quantity": "-100",
+        "tradePrice": "80",
+        "closePrice": "80",
+        "ibCommission": "0",
+        "fxRateToBase": "1.0",
+        "currency": "USD",
+        "dateTime": "2025-02-01 10:00:00",
+        "tradeDate": "2025-02-01",
+        "reportDate": "2025-02-01",
+        "fifoPnlRealized": "1199",
+        "cost": "6801",
+        "proceeds": "8000",
+        "isin": "US5951121038",
+    }
+    # STK-BUY bewusst VOR dem STK-SELL in der trades-Liste -> auch in debug_rows zuerst.
+    trades = [
+        sell_opt,
+        make_assignment("2024-03-15", 1, strike="70", expiry="2024-03-15",
+                        pc="P", underlying="MU"),
+        stk_buy,
+        stk_sell,
+    ]
+    closed_lots = [{
+        "assetCategory": "STK",
+        "currency": "USD",
+        "reportDate": "2025-02-01",
+        "dateTime": "2025-02-01 10:00:00",
+        "openDateTime": "2024-03-15 16:20:00",
+        "quantity": "100",
+        "cost": "6801",
+        "fifoPnlRealized": "1199",
+        "fxRateToBase": "1.0",
+        "symbol": "MU",
+        "description": "MICRON TECHNOLOGY INC",
+        "isin": "US5951121038",
+        "underlyingSymbol": "MU",
+    }]
+    rd = calculate_for_trades(trades, tax_year=2025, closed_lots=closed_lots)
+
+    stk_rows = [r for r in rd["trade_details"]
+                if r.get("symbol") == "MU" and r.get("source") == "trades"
+                and r.get("assetCategory") == "STK"]
+    buy_rows = [r for r in stk_rows if r.get("buySell") == "BUY"]
+    sell_rows = [r for r in stk_rows if r.get("buySell") == "SELL"]
+    assert len(buy_rows) == 1 and len(sell_rows) == 1, "erwarte je 1 BUY- und SELL-Row"
+    assert not buy_rows[0].get("stillhalter_adjusted"), \
+        "STK-BUY (Short-Cover) darf NICHT von der Cross-Year-Put-Korrektur getroffen werden"
+    assert sell_rows[0].get("stillhalter_adjusted"), \
+        "STK-SELL muss die Cross-Year-Put-Korrektur erhalten"
+    assert_close(buy_rows[0]["cost"], -6300.0, label="TC16 BUY cost unveraendert")
+    assert_close(sell_rows[0]["cost"], 7000.0, label="TC16 SELL cost = strike x qty")
+
+    print("  TC16 Cross-Year-Put-Korrektur trifft nur SELL-Rows: OK")
+    print(f"    BUY-cost {buy_rows[0]['cost']:.2f} (unveraendert), SELL-cost {sell_rows[0]['cost']:.2f}")
+
+
+def test_cross_year_put_correction_handles_spaced_underlying_symbol():
+    """TC17: Cross-Year-Put-Korrektur fuer Klassen-Aktien mit Leerzeichen im Symbol.
+
+    IBKR fuehrt Klassen-Aktien als 'BRK B'. put_assignment_lots, der trades-Loop
+    und der closed_lots-Index keyen mit dem vollen underlyingSymbol. Die
+    debug_rows-Schleife und der closed_lots-Index duerfen das underlyingSymbol
+    NICHT auf 'BRK' splitten, sonst bleibt die Korrektur stumm bei 0 und die
+    Pools / cross_year_put_total uncorrected.
+    """
+    sell_opt = make_sell("2024-03-01", 1, 2.00, strike="70", expiry="2024-03-15",
+                         pc="P", underlying="BRK B", commission=-1.0)
+    sell_opt["currency"] = "USD"
+    stk_sell = {
+        "tradeID": "brkb_2025_sale_prior_lot",
+        "assetCategory": "STK",
+        "transactionType": "ExchTrade",
+        "buySell": "SELL",
+        "openCloseIndicator": "C",
+        "underlyingSymbol": "BRK B",
+        "symbol": "BRK B",
+        "description": "BERKSHIRE HATHAWAY INC-CL B",
+        "quantity": "-100",
+        "tradePrice": "80",
+        "closePrice": "80",
+        "ibCommission": "0",
+        "fxRateToBase": "1.0",
+        "currency": "USD",
+        "dateTime": "2025-02-01 10:00:00",
+        "tradeDate": "2025-02-01",
+        "reportDate": "2025-02-01",
+        "fifoPnlRealized": "1199",
+        "cost": "6801",
+        "proceeds": "8000",
+        "isin": "US0846707026",
+    }
+    trades = [
+        sell_opt,
+        make_assignment("2024-03-15", 1, strike="70", expiry="2024-03-15",
+                        pc="P", underlying="BRK B"),
+        stk_sell,
+    ]
+    closed_lots = [{
+        "assetCategory": "STK",
+        "currency": "USD",
+        "reportDate": "2025-02-01",
+        "dateTime": "2025-02-01 10:00:00",
+        "openDateTime": "2024-03-15 16:20:00",
+        "quantity": "100",
+        "cost": "6801",
+        "fifoPnlRealized": "1199",
+        "fxRateToBase": "1.0",
+        "symbol": "BRK B",
+        "description": "BERKSHIRE HATHAWAY INC-CL B",
+        "isin": "US0846707026",
+        "underlyingSymbol": "BRK B",
+    }]
+    rd = calculate_for_trades(trades, tax_year=2025, closed_lots=closed_lots)
+
+    stock_rows = [r for r in rd["trade_details"]
+                  if r.get("symbol") == "BRK B" and r.get("source") == "trades"]
+    assert len(stock_rows) == 1, f"erwartet 1 BRK B-Aktienzeile, aktuell {len(stock_rows)}"
+    assert stock_rows[0].get("stillhalter_adjusted"), \
+        "BRK B-Verkauf muss die Cross-Year-Put-Korrektur erhalten"
+    assert_close(stock_rows[0]["cost"], 7000.0, label="TC17 stock cost = strike x qty")
+    assert_close(stock_rows[0]["fifoPnlRealized"], 1000.0, label="TC17 stock pnl raw")
+
+    audit = rd["audit"]
+    assert len(audit.get("cross_year_put_corrections", [])) == 1, \
+        f"erwartet 1 Cross-Year-Korrektur, aktuell {audit.get('cross_year_put_corrections')}"
+    assert_close(audit["cross_year_put_total"], 199.0, label="TC17 cross_year_put_total")
+
+    print("  TC17 Cross-Year-Put fuer Leerzeichen-Symbol (BRK B): OK")
+    print(f"    cost {stock_rows[0]['cost']:.2f}, cross_year_put_total {audit['cross_year_put_total']:.2f}")
+
+
 if __name__ == "__main__":
     test_cross_year_put_series()
     test_cross_year_call_series()
@@ -792,4 +1050,7 @@ if __name__ == "__main__":
     test_same_year_put_requires_matching_closed_lot()
     test_zufluss_fifo_current_close_consumes_prior_sell_first()
     test_zufluss_fifo_prior_close_consumes_prior_sell_before_tax_year()
-    print("\nOK: alle 14 TCs gruen")
+    test_cross_year_put_topf1_consistent_across_fx_rates()
+    test_cross_year_put_correction_only_hits_sell_rows()
+    test_cross_year_put_correction_handles_spaced_underlying_symbol()
+    print("\nOK: alle 17 TCs gruen")

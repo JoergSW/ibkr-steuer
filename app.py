@@ -366,7 +366,7 @@ def merge_report_data(reports):
                   'domestic_taxed_dividends_eur', 'domestic_withholding_tax_eur',
                   'debit_interest_eur', 'options_gain_eur', 'options_loss_eur',
                   'withholding_tax_eur', 'fx_total_gain', 'fx_total_loss', 'fx_translation',
-                  'fx_correction_total']:
+                  'fx_correction_total', 'fx_correction_kap_inv_taxable']:
         merged[field] = sum(r.get(field, 0) for r in reports)
 
     # Recalculated fields
@@ -420,6 +420,17 @@ def merge_report_data(reports):
             for k, v in r.get(dict_field, {}).items():
                 merged_dict[k] = merged_dict.get(k, 0) + v
         merged[dict_field] = merged_dict
+
+    merged_kap_inv_fx = {}
+    for r in reports:
+        for isin, data in r.get('fx_correction_kap_inv_by_isin', {}).items():
+            if isin not in merged_kap_inv_fx:
+                merged_kap_inv_fx[isin] = dict(data)
+            else:
+                existing = merged_kap_inv_fx[isin]
+                existing['raw_delta'] = existing.get('raw_delta', 0) + data.get('raw_delta', 0)
+                existing['taxable_delta'] = existing.get('taxable_delta', 0) + data.get('taxable_delta', 0)
+    merged['fx_correction_kap_inv_by_isin'] = merged_kap_inv_fx
 
     # FX correction details (list concat)
     merged['fx_correction_details'] = []
@@ -923,6 +934,7 @@ fx_corr_by_topf = d.get('fx_correction_by_topf', {})
 tk_gain_adj = d.get('fx_corr_gain_adj', {})
 tk_loss_adj = d.get('fx_corr_loss_adj', {})
 tageskurs_aktiv = False
+tageskurs_kapinv_corr_raw = 0
 tageskurs_kapinv_corr = 0
 
 if abs(fx_corr_total) > 0.01:
@@ -945,14 +957,15 @@ if abs(fx_corr_total) > 0.01:
     if tageskurs_aktiv:
         corr_topf1 = fx_corr_by_topf.get('Topf1', 0)
         corr_topf2 = fx_corr_by_topf.get('Topf2', 0)
-        tageskurs_kapinv_corr = fx_corr_by_topf.get('KAP-INV', 0)
+        tageskurs_kapinv_corr_raw = fx_corr_by_topf.get('KAP-INV', 0)
+        tageskurs_kapinv_corr = calculate_tax_report.get_kap_inv_tageskurs_delta_for_reporting(d)
         topf_1 += corr_topf1
         adj_topf_2 += corr_topf2
         if invstg_aktiv:
             adj_zeile_19 += corr_topf1 + corr_topf2
             zeile_19 += corr_topf1 + corr_topf2
         else:
-            topf_1 += tageskurs_kapinv_corr
+            topf_1 += tageskurs_kapinv_corr_raw
             adj_zeile_19 += fx_corr_total
             zeile_19 += fx_corr_total
         # Zeilen 20/22/23 per-Lot gain/loss adjustments
@@ -963,6 +976,7 @@ if abs(fx_corr_total) > 0.01:
             zeile_20 += tk_gain_adj.get('KAP-INV', 0)
             zeile_23 -= tk_loss_adj.get('KAP-INV', 0)
     else:
+        tageskurs_kapinv_corr_raw = 0
         tageskurs_kapinv_corr = 0
 
 # ── Konsolidierte Toggle-bereinigte Werte (Single Source of Truth) ──────────
@@ -1217,6 +1231,7 @@ if has_etf_data and invstg_aktiv:
     etf_net_taxable = kap_inv.get('etf_net_taxable_eur', 0) + tageskurs_kapinv_corr
     etf_unknown = kap_inv.get('etf_unknown_isins', [])
     etf_stillhalter = kap_inv.get('etf_stillhalter_premium_eur', 0)
+    kapinv_fx_by_isin = d.get('fx_correction_kap_inv_by_isin', {}) or {}
 
 if has_etf_data and invstg_aktiv:
     section_title("Anlage KAP-INV · Investmentfonds (InvStG)")
@@ -1250,10 +1265,19 @@ if has_etf_data and invstg_aktiv:
                 new_loss_tax = raw_loss * (1 - new_tfs)
                 new_div_tax = raw_div * (1 - new_tfs)
                 new_wht_anrechenbar = raw_wht * (1 - new_tfs)
+                raw_tk_delta = kapinv_fx_by_isin.get(isin, {}).get('raw_delta', 0) if tageskurs_aktiv else 0
+                old_tk_tax = raw_tk_delta * (1 - old_tfs)
+                new_tk_tax = raw_tk_delta * (1 - new_tfs)
                 etf_gain_taxable += (new_gain_tax - old_gain_tax)
                 etf_loss_taxable += (new_loss_tax - old_loss_tax)
                 etf_div_taxable += (new_div_tax - old_div_tax)
-                etf_net_taxable += (new_gain_tax - old_gain_tax) + (new_loss_tax - old_loss_tax) + (new_div_tax - old_div_tax)
+                etf_net_taxable += (
+                    (new_gain_tax - old_gain_tax)
+                    + (new_loss_tax - old_loss_tax)
+                    + (new_div_tax - old_div_tax)
+                    + (new_tk_tax - old_tk_tax)
+                )
+                tageskurs_kapinv_corr += (new_tk_tax - old_tk_tax)
                 info['tfs_rate'] = new_tfs
                 info['gain_taxable'] = new_gain_tax
                 info['loss_taxable'] = new_loss_tax
@@ -1280,6 +1304,10 @@ if has_etf_data and invstg_aktiv:
     wht_metric_html = metric_card("ETF-QSt anrechenbar", etf_wht)
     if abs(etf_wht_raw - etf_wht) > 0.01:
         wht_metric_html = metric_card("ETF-QSt roh", etf_wht_raw) + wht_metric_html
+    tk_metric_html = ""
+    if tageskurs_aktiv and abs(tageskurs_kapinv_corr_raw) > 0.01:
+        tk_metric_html += metric_card("Tageskurs-Korr. roh", tageskurs_kapinv_corr_raw, "info")
+        tk_metric_html += metric_card("Tageskurs-Korr. stpfl.", tageskurs_kapinv_corr, "info")
 
     st.markdown(
         '<div class="metric-grid">'
@@ -1288,6 +1316,7 @@ if has_etf_data and invstg_aktiv:
         + metric_card("Teilfreistellung", etf_gain_raw - etf_gain_taxable + etf_loss_raw - etf_loss_taxable, "info")
         + metric_card("ETF-Netto (stpfl.)", etf_gain_taxable + etf_loss_taxable, "saldo")
         + metric_card("ETF-Div. (stpfl.)", etf_div_taxable)
+        + tk_metric_html
         + wht_metric_html
         + '</div>',
         unsafe_allow_html=True
@@ -2322,7 +2351,7 @@ ETF-Quellensteuer wird um die Teilfreistellung gekürzt und als anrechenbare QSt
 ```
 Korrektur = Σ |Anschaffungskosten| × (FX_Verkauf − FX_Kauf) pro CLOSED_LOT
 Futures ausgeschlossen (Kostenbasis = Notional, kein realer Cashflow).
-Wird auf Topf 1, Topf 2 und KAP-INV aufgeteilt.
+Wird auf Topf 1, Topf 2 und KAP-INV aufgeteilt; KAP-INV-Delta wird pro ISIN um die Teilfreistellung gekürzt.
 ```
 """)
 

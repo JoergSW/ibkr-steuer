@@ -24,14 +24,17 @@ SCENARIOS = {
 }
 
 FIELDS = ['zeile_19', 'zeile_20', 'zeile_22', 'zeile_23', 'zeile_41',
-          'etf_net_taxable', 'etf_wht']
+          'etf_net_taxable', 'etf_wht', 'kap_inv_tageskurs']
 
 
 def compute_user_facing(rd):
     """Repliziert das GUI-final-Dict mit allen Default-Toggles aktiv (Tageskurs,
     InvStG, Zuflussprinzip). Die Werte entsprechen dem, was der User sieht.
     Logik gespiegelt aus app.py."""
-    from calculate_tax_report import get_kap_inv_wht_for_reporting
+    from calculate_tax_report import (
+        get_kap_inv_tageskurs_delta_for_reporting,
+        get_kap_inv_wht_for_reporting,
+    )
 
     pre_z19 = rd.get('zeile_19_netto_eur', 0)
     pre_z20 = rd.get('zeile_20_stock_gains_eur', 0)
@@ -73,8 +76,8 @@ def compute_user_facing(rd):
         z22 -= tk_loss.get('Topf2', 0)
         z23 -= tk_loss.get('Topf1', 0)
     has_etf = bool(kap_inv.get('etf_by_isin'))
-    etf_net = (kap_inv.get('etf_net_taxable_eur', 0)
-               + (fx_corr.get('KAP-INV', 0) if tageskurs_aktiv else 0)) if has_etf else 0
+    kap_inv_tageskurs = get_kap_inv_tageskurs_delta_for_reporting(rd) if (has_etf and tageskurs_aktiv) else 0
+    etf_net = (kap_inv.get('etf_net_taxable_eur', 0) + kap_inv_tageskurs) if has_etf else 0
     return {
         'zeile_19': z19,
         'zeile_20': z20,
@@ -83,6 +86,7 @@ def compute_user_facing(rd):
         'zeile_41': z41,
         'etf_net_taxable': etf_net,
         'etf_wht': get_kap_inv_wht_for_reporting(kap_inv) if has_etf else 0,
+        'kap_inv_tageskurs': kap_inv_tageskurs,
     }
 
 

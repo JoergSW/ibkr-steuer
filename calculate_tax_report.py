@@ -33,6 +33,14 @@ def get_kap_inv_wht_for_reporting(kap_inv):
         return safe_float(kap_inv.get('etf_wht_anrechenbar_eur'))
     return safe_float(kap_inv.get('etf_wht_eur'))
 
+def get_kap_inv_tageskurs_delta_for_reporting(report_data):
+    """Return KAP-INV Tageskurs delta after Teilfreistellung, with legacy fallback."""
+    if not report_data:
+        return 0.0
+    if 'fx_correction_kap_inv_taxable' in report_data:
+        return safe_float(report_data.get('fx_correction_kap_inv_taxable'))
+    return safe_float((report_data.get('fx_correction_by_topf') or {}).get('KAP-INV'))
+
 GERMAN_DIVIDEND_TAX_TOTAL_RATE = 0.26375
 GERMAN_KEST_RATE = 0.25
 GERMAN_SOLI_RATE = 0.01375
@@ -2597,6 +2605,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     fx_correction_total = 0.0
     fx_correction_details = []
     fx_corr_by_topf = {'Topf1': 0.0, 'Topf2': 0.0, 'KAP-INV': 0.0}
+    fx_correction_kap_inv_taxable = 0.0
+    fx_correction_kap_inv_by_isin = {}
     # Per-Topf gain/loss adjustments for consistent Zeilen 20/22/23
     fx_corr_gain_adj = {'Topf1': 0.0, 'Topf2': 0.0, 'KAP-INV': 0.0}
     fx_corr_loss_adj = {'Topf1': 0.0, 'Topf2': 0.0, 'KAP-INV': 0.0}
@@ -2738,18 +2748,41 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             # Determine topf
             sub = lot.get('subCategory', '')
             isin = lot.get('isin', '').strip()
+            kap_inv_tfs_rate = None
+            kap_inv_classification = ''
             if category == 'STK' and isin and (sub == 'ETF' or is_known_etf(isin)):
                 cls = _effective_classification(isin)
                 if cls == 'anlage_so':
                     continue  # Gold-ETCs excluded from KAP entirely
-                topf = 'KAP-INV' if cls not in ('no_invstg', None) else 'Topf2'
+                if cls not in ('no_invstg', None):
+                    topf = 'KAP-INV'
+                    kap_inv_tfs_rate = get_teilfreistellung(isin)
+                    kap_inv_classification = cls
+                else:
+                    topf = 'Topf2'
             elif category == 'STK':
                 topf = 'Topf1'
             else:
                 topf = 'Topf2'
             fx_corr_by_topf[topf] += delta
+            if topf == 'KAP-INV' and isin:
+                tfs_rate = kap_inv_tfs_rate if kap_inv_tfs_rate is not None else get_teilfreistellung(isin)
+                taxable_delta = delta * (1 - tfs_rate)
+                fx_correction_kap_inv_taxable += taxable_delta
+                info = get_etf_info(isin)
+                if isin not in fx_correction_kap_inv_by_isin:
+                    fx_correction_kap_inv_by_isin[isin] = {
+                        'ticker': info['ticker'] if info else isin[:12],
+                        'name': info['name'] if info else '',
+                        'classification': kap_inv_classification or (info['classification'] if info else ''),
+                        'tfs_rate': tfs_rate,
+                        'raw_delta': 0.0,
+                        'taxable_delta': 0.0,
+                    }
+                fx_correction_kap_inv_by_isin[isin]['raw_delta'] += delta
+                fx_correction_kap_inv_by_isin[isin]['taxable_delta'] += taxable_delta
 
-            fx_correction_details.append({
+            detail = {
                 'symbol': lot.get('symbol', ''),
                 'description': lot.get('description', ''),
                 'isin': isin,
@@ -2765,7 +2798,11 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 'delta_eur': round(delta, 5),
                 'topf': topf,
                 'underlyingSymbol': lot.get('underlyingSymbol', ''),
-            })
+            }
+            if topf == 'KAP-INV':
+                detail['tfs_rate'] = kap_inv_tfs_rate if kap_inv_tfs_rate is not None else get_teilfreistellung(isin)
+                detail['taxable_delta_eur'] = round(delta * (1 - detail['tfs_rate']), 5)
+            fx_correction_details.append(detail)
 
             # Track gain/loss shift per lot for consistent Zeilen 20/22/23
             pnl_raw = safe_float(lot.get('fifoPnlRealized'), 0)
@@ -3090,6 +3127,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         # Per-lot FX correction (Tageskurs-Methode)
         "fx_correction_total": fx_correction_total,
         "fx_correction_by_topf": fx_corr_by_topf,
+        "fx_correction_kap_inv_taxable": fx_correction_kap_inv_taxable,
+        "fx_correction_kap_inv_by_isin": fx_correction_kap_inv_by_isin,
         "fx_correction_details": fx_correction_details,
         "fx_corr_gain_adj": fx_corr_gain_adj,
         "fx_corr_loss_adj": fx_corr_loss_adj,

@@ -83,6 +83,55 @@ class GermanDividendTaxTest(unittest.TestCase):
         self.assertEqual(round(report["zeile_38_solidaritaetszuschlag_eur"], 2), 13.75)
         self.assertEqual(round(report["zeile_41_withholding_tax_eur"], 2), 75.00)
 
+    def test_german_dividend_tax_with_frtax_de_tax_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_statement_of_funds(
+                tmp,
+                [
+                    {
+                        "activityCode": "DIV",
+                        "activityDescription": (
+                            "RHM(DE0007030009) Cash Dividend EUR 11.50 per Share "
+                            "(Ordinary Dividend)"
+                        ),
+                        "amount": "287.5",
+                        "assetCategory": "STK",
+                        "currency": "EUR",
+                        "date": "2026-05-15",
+                        "fxRateToBase": "1",
+                        "isin": "DE0007030009",
+                        "reportDate": "2026-05-15",
+                        "symbol": "RHM",
+                    },
+                    {
+                        "activityCode": "FRTAX",
+                        "activityDescription": (
+                            "RHM(DE0007030009) Cash Dividend EUR 11.50 per Share "
+                            "- DE Tax"
+                        ),
+                        "amount": "-75.83",
+                        "assetCategory": "STK",
+                        "currency": "EUR",
+                        "date": "2026-05-15",
+                        "fxRateToBase": "1",
+                        "isin": "DE0007030009",
+                        "reportDate": "2026-05-15",
+                        "symbol": "RHM",
+                    },
+                ],
+            )
+
+            report = calculate_tax(tmp, tax_year=2026)
+
+        self.assertEqual(
+            round(report["zeile_7_kapitalertraege_mit_inlaendischem_steuerabzug_eur"], 2),
+            287.50,
+        )
+        self.assertEqual(round(report["zeile_19_netto_eur"], 2), 0.00)
+        self.assertEqual(round(report["zeile_37_kapitalertragsteuer_eur"], 2), 71.88)
+        self.assertEqual(round(report["zeile_38_solidaritaetszuschlag_eur"], 2), 3.95)
+        self.assertEqual(round(report["zeile_41_withholding_tax_eur"], 2), 0.00)
+
 
 if __name__ == "__main__":
     unittest.main()

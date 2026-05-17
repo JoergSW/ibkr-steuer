@@ -1471,16 +1471,25 @@ if trade_details and tageskurs_aktiv:
         underlying = (lot.get('underlyingSymbol', '') or lot.get('symbol', '') or '').split()[0]
         open_dt = (lot.get('openDateTime', '') or '')[:10]
         close_dt = lot.get('reportDate', '')
+        delta_eur = lot['delta_eur']
+        note = f'Tageskurs-Korrektur (Kauf {open_dt}, Kurs {lot["fx_open"]:.5f} → {lot["fx_close"]:.5f})'
+        if lot.get('topf') == 'KAP-INV' and invstg_aktiv:
+            isin = lot.get('isin', '')
+            tfs_rate = etf_by_isin.get(isin, {}).get('tfs_rate', lot.get('tfs_rate', 0))
+            taxable_delta = delta_eur * (1 - tfs_rate)
+            if abs(taxable_delta - delta_eur) > 0.005:
+                note += f' · roh {fmt_de(delta_eur)} EUR, stpfl. nach TFS {fmt_de(taxable_delta)} EUR'
+            delta_eur = taxable_delta
         trade_details.append({
             'dateTime': close_dt, 'reportDate': close_dt,
             'symbol': lot.get('symbol', ''),
-            'description': f'Tageskurs-Korrektur (Kauf {open_dt}, Kurs {lot["fx_open"]:.5f} → {lot["fx_close"]:.5f})',
+            'description': note,
             'isin': lot.get('isin', ''), 'assetCategory': lot.get('assetCategory', ''),
             'subCategory': lot.get('subCategory', ''), 'buySell': '', 'openClose': '',
             'quantity': lot.get('quantity', ''), 'transactionType': 'FX-Korrektur',
             'currency': lot.get('currency', ''), 'tradePrice': 0, 'cost': lot.get('cost', 0),
             'proceeds': 0, 'fifoPnlRealized': 0, 'fxRateToBase': 0,
-            'pnl_eur': lot['delta_eur'], 'topf': lot.get('topf', 'Topf2'),
+            'pnl_eur': delta_eur, 'topf': lot.get('topf', 'Topf2'),
             'strike': '', 'expiry': '', 'putCall': '', 'multiplier': '',
             'underlyingSymbol': underlying, 'source': 'tageskurs_korrektur',
         })

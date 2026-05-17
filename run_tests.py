@@ -26,6 +26,14 @@ SCENARIOS = {
 FIELDS = ['zeile_19', 'zeile_20', 'zeile_22', 'zeile_23', 'zeile_41',
           'etf_net_taxable', 'etf_wht', 'kap_inv_tageskurs']
 
+SYNTHETIC_TESTS = [
+    ("Cross-Year-Series-Tests", "tests/test_cross_year_series.py"),
+    ("Quarterly-History-Extraction", "tests/test_quarterly_history_extraction.py"),
+    ("KAP-INV-WHT", "tests/test_kap_inv_wht.py"),
+    ("KAP-INV-Tageskurs-TFS", "tests/test_kap_inv_tageskurs.py"),
+    ("German-Dividend-Tax", "-m unittest tests/test_german_dividend_tax.py"),
+]
+
 
 def compute_user_facing(rd):
     """Repliziert das GUI-final-Dict mit allen Default-Toggles aktiv (Tageskurs,
@@ -184,15 +192,16 @@ def run_tests():
     if failed > 0:
         sys.exit(1)
 
-    # Synthetische Cross-Year-Series-Tests (Issues #61/#62). Real-Audit-Daten enthalten
-    # 0 Cross-Year-Same-Series bzw. Mixed-Year-Konsum; daher synthetische TCs fuer Bug-Coverage.
+    # Synthetische Regressionen: echte Audit-Daten decken nicht alle Edge-Cases ab.
     print(f"\n{'-'*60}")
-    print("Synthetische Cross-Year-Series-Tests (Issues #61/#62)")
-    sys.stdout.flush()
-    rc = os.system(f"{shlex.quote(sys.executable)} tests/test_cross_year_series.py")
-    if rc != 0:
-        print("FAIL: Cross-Year-Series-Tests")
-        sys.exit(1)
+    print("Synthetische Regressionstests")
+    for label, test_cmd in SYNTHETIC_TESTS:
+        print(f"  RUN   {label}")
+        sys.stdout.flush()
+        rc = os.system(f"{shlex.quote(sys.executable)} {test_cmd}")
+        if rc != 0:
+            print(f"  FAIL  {label}")
+            sys.exit(1)
 
 
 if __name__ == '__main__':

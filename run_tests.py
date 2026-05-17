@@ -23,13 +23,16 @@ SCENARIOS = {
     },
 }
 
-FIELDS = ['zeile_19', 'zeile_20', 'zeile_22', 'zeile_23', 'zeile_41', 'etf_net_taxable']
+FIELDS = ['zeile_19', 'zeile_20', 'zeile_22', 'zeile_23', 'zeile_41',
+          'etf_net_taxable', 'etf_wht']
 
 
 def compute_user_facing(rd):
     """Repliziert das GUI-final-Dict mit allen Default-Toggles aktiv (Tageskurs,
     InvStG, Zuflussprinzip). Die Werte entsprechen dem, was der User sieht.
     Logik gespiegelt aus app.py."""
+    from calculate_tax_report import get_kap_inv_wht_for_reporting
+
     pre_z19 = rd.get('zeile_19_netto_eur', 0)
     pre_z20 = rd.get('zeile_20_stock_gains_eur', 0)
     pre_z22 = rd.get('zeile_22_other_losses_eur', 0)
@@ -79,6 +82,7 @@ def compute_user_facing(rd):
         'zeile_23': z23,
         'zeile_41': z41,
         'etf_net_taxable': etf_net,
+        'etf_wht': get_kap_inv_wht_for_reporting(kap_inv) if has_etf else 0,
     }
 
 

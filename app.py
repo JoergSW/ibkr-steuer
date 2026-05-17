@@ -448,7 +448,7 @@ def merge_report_data(reports):
         'etf_gain_raw_eur': 0, 'etf_loss_raw_eur': 0,
         'etf_gain_taxable_eur': 0, 'etf_loss_taxable_eur': 0,
         'etf_dividends_raw_eur': 0, 'etf_dividends_taxable_eur': 0,
-        'etf_wht_eur': 0, 'etf_net_taxable_eur': 0,
+        'etf_wht_eur': 0, 'etf_wht_anrechenbar_eur': 0, 'etf_net_taxable_eur': 0,
         'etf_by_isin': {}, 'etf_unknown_isins': [],
         'etf_stillhalter_premium_eur': 0,
     }
@@ -456,14 +456,19 @@ def merge_report_data(reports):
         ki = r.get('kap_inv', {})
         for k in ['etf_gain_raw_eur', 'etf_loss_raw_eur', 'etf_gain_taxable_eur',
                    'etf_loss_taxable_eur', 'etf_dividends_raw_eur', 'etf_dividends_taxable_eur',
-                   'etf_wht_eur', 'etf_net_taxable_eur', 'etf_stillhalter_premium_eur']:
-            merged_kap[k] += ki.get(k, 0)
+                   'etf_wht_eur', 'etf_wht_anrechenbar_eur', 'etf_net_taxable_eur',
+                   'etf_stillhalter_premium_eur']:
+            if k == 'etf_wht_anrechenbar_eur':
+                merged_kap[k] += calculate_tax_report.get_kap_inv_wht_for_reporting(ki)
+            else:
+                merged_kap[k] += ki.get(k, 0)
         for isin, data in ki.get('etf_by_isin', {}).items():
             if isin not in merged_kap['etf_by_isin']:
                 merged_kap['etf_by_isin'][isin] = dict(data)
             else:
                 existing = merged_kap['etf_by_isin'][isin]
-                for nk in ['gain', 'loss', 'div', 'wht', 'gain_taxable', 'loss_taxable', 'div_taxable']:
+                for nk in ['gain', 'loss', 'div', 'wht', 'wht_anrechenbar',
+                           'gain_taxable', 'loss_taxable', 'div_taxable']:
                     existing[nk] = existing.get(nk, 0) + data.get(nk, 0)
         for isin in ki.get('etf_unknown_isins', []):
             if isin not in merged_kap['etf_unknown_isins']:
@@ -1002,7 +1007,7 @@ final = {
     'zeile_38': zeile_38,
     'quellensteuer': quellensteuer,
     'etf_net_taxable': (kap_inv.get('etf_net_taxable_eur', 0) + tageskurs_kapinv_corr) if (has_etf_data and invstg_aktiv) else 0,
-    'etf_wht':         kap_inv.get('etf_wht_eur', 0)                                     if (has_etf_data and invstg_aktiv) else 0,
+    'etf_wht':         calculate_tax_report.get_kap_inv_wht_for_reporting(kap_inv)      if (has_etf_data and invstg_aktiv) else 0,
 }
 created_at = _dt.now().strftime('%d.%m.%Y %H:%M')
 
@@ -1207,7 +1212,8 @@ if has_etf_data and invstg_aktiv:
     etf_loss_taxable = kap_inv.get('etf_loss_taxable_eur', 0)
     etf_div_raw = kap_inv.get('etf_dividends_raw_eur', 0)
     etf_div_taxable = kap_inv.get('etf_dividends_taxable_eur', 0)
-    etf_wht = kap_inv.get('etf_wht_eur', 0)
+    etf_wht_raw = kap_inv.get('etf_wht_eur', 0)
+    etf_wht = calculate_tax_report.get_kap_inv_wht_for_reporting(kap_inv)
     etf_net_taxable = kap_inv.get('etf_net_taxable_eur', 0) + tageskurs_kapinv_corr
     etf_unknown = kap_inv.get('etf_unknown_isins', [])
     etf_stillhalter = kap_inv.get('etf_stillhalter_premium_eur', 0)
@@ -1236,12 +1242,14 @@ if has_etf_data and invstg_aktiv:
                 raw_gain = info.get('gain', 0)
                 raw_loss = info.get('loss', 0)
                 raw_div = info.get('div', 0)
+                raw_wht = info.get('wht', 0)
                 old_gain_tax = info.get('gain_taxable', raw_gain)
                 old_loss_tax = info.get('loss_taxable', raw_loss)
                 old_div_tax = info.get('div_taxable', raw_div)
                 new_gain_tax = raw_gain * (1 - new_tfs)
                 new_loss_tax = raw_loss * (1 - new_tfs)
                 new_div_tax = raw_div * (1 - new_tfs)
+                new_wht_anrechenbar = raw_wht * (1 - new_tfs)
                 etf_gain_taxable += (new_gain_tax - old_gain_tax)
                 etf_loss_taxable += (new_loss_tax - old_loss_tax)
                 etf_div_taxable += (new_div_tax - old_div_tax)
@@ -1250,8 +1258,11 @@ if has_etf_data and invstg_aktiv:
                 info['gain_taxable'] = new_gain_tax
                 info['loss_taxable'] = new_loss_tax
                 info['div_taxable'] = new_div_tax
+                info['wht_anrechenbar'] = new_wht_anrechenbar
                 cls_map = {0.30: 'aktienfonds', 0.15: 'mischfonds', 0.0: 'sonstiger_fonds'}
                 info['classification'] = cls_map.get(new_tfs, 'sonstiger_fonds')
+        etf_wht = abs(sum(info.get('wht_anrechenbar', info.get('wht', 0)) for info in etf_by_isin.values()))
+        kap_inv['etf_wht_anrechenbar_eur'] = etf_wht
 
     # ETF-Overrides in final-Dict spiegeln
     final['etf_net_taxable'] = etf_net_taxable
@@ -1262,9 +1273,13 @@ if has_etf_data and invstg_aktiv:
 <div class="hero-card-inv">
     <div class="hero-label">KAP-INV · Steuerpflichtige Erträge (nach Teilfreistellung)</div>
     <div class="hero-value" style="color:{inv_hero_color}">{fmt(etf_net_taxable)}</div>
-    <div class="hero-formula">G/V stpfl. ({fmt(etf_gain_taxable + etf_loss_taxable)}) + Div stpfl. ({fmt(etf_div_taxable)}) - QSt ({fmt(etf_wht)})</div>
+    <div class="hero-formula">G/V stpfl. ({fmt(etf_gain_taxable + etf_loss_taxable)}) + Div stpfl. ({fmt(etf_div_taxable)}) - anr. QSt ({fmt(etf_wht)})</div>
 </div>
 """, unsafe_allow_html=True)
+
+    wht_metric_html = metric_card("ETF-QSt anrechenbar", etf_wht)
+    if abs(etf_wht_raw - etf_wht) > 0.01:
+        wht_metric_html = metric_card("ETF-QSt roh", etf_wht_raw) + wht_metric_html
 
     st.markdown(
         '<div class="metric-grid">'
@@ -1273,7 +1288,7 @@ if has_etf_data and invstg_aktiv:
         + metric_card("Teilfreistellung", etf_gain_raw - etf_gain_taxable + etf_loss_raw - etf_loss_taxable, "info")
         + metric_card("ETF-Netto (stpfl.)", etf_gain_taxable + etf_loss_taxable, "saldo")
         + metric_card("ETF-Div. (stpfl.)", etf_div_taxable)
-        + metric_card("ETF-Quellensteuer", etf_wht)
+        + wht_metric_html
         + '</div>',
         unsafe_allow_html=True
     )
@@ -2299,7 +2314,7 @@ Teilfreistellung wird pro ISIN angewendet:
   Sonstiger Fonds:                 0% steuerfrei
 
 KAP-INV Netto = (ETF-G/V × (1 − TFS)) + (ETF-Div × (1 − TFS))
-ETF-Quellensteuer wird separat auf KAP-INV angerechnet.
+ETF-Quellensteuer wird um die Teilfreistellung gekürzt und als anrechenbare QSt auf KAP-INV ausgewiesen.
 ```
 
 **Tageskurs-Korrektur (wenn aktiviert):**
@@ -2344,7 +2359,9 @@ if has_etf_data and invstg_aktiv:
     inv_export += f"  ETF-Verluste (stpfl.): {fmt_de(etf_loss_taxable):>14} EUR\n"
     inv_export += f"  ETF-Dividenden (roh):  {fmt_de(etf_div_raw):>14} EUR\n"
     inv_export += f"  ETF-Dividenden (stpfl.):{fmt_de(etf_div_taxable):>13} EUR\n"
-    inv_export += f"  ETF-Quellensteuer:     {fmt_de(etf_wht):>14} EUR\n"
+    if abs(etf_wht_raw - etf_wht) > 0.01:
+        inv_export += f"  ETF-QSt (roh):         {fmt_de(etf_wht_raw):>14} EUR\n"
+    inv_export += f"  ETF-QSt anrechenbar:   {fmt_de(etf_wht):>14} EUR\n"
     inv_export += f"  ─────────────────────────────────────────────────\n"
     inv_export += f"  KAP-INV Netto (stpfl.):{fmt_de(etf_net_taxable):>14} EUR\n"
     for isin, info in sorted(etf_by_isin.items(), key=lambda x: x[1].get('ticker', '')):
@@ -2401,7 +2418,7 @@ ANLAGE KAP EINTRAGUNGEN
   Zeile 22 (Verluste o. Aktien): {fmt_de(final['zeile_22']):>8} EUR
   Zeile 23 (Aktienverluste): {fmt_de(final['zeile_23']):>11} EUR
   Zeile 41 (ausl. Quellensteuer): {fmt_de(final['quellensteuer']):>8} EUR
-{"" if not (has_etf_data and invstg_aktiv) else chr(10) + "ANLAGE KAP-INV EINTRAGUNGEN" + chr(10) + f"  KAP-INV Erträge (nach TFS): {fmt_de(final['etf_net_taxable']):>8} EUR" + chr(10) + f"  KAP-INV Quellensteuer: {fmt_de(final['etf_wht']):>13} EUR" + chr(10)}{"" if not has_so_data else chr(10) + "ANLAGE SO (§23 EStG) — PRIVATE VERÄUSSERUNGSGESCHÄFTE" + chr(10) + f"  Physische Gold-ETCs (BFH VIII R 4/15)" + chr(10) + f"  Steuerpflichtig (≤ 1J): {fmt_de(so_taxable_for_row):>12} EUR  → Anlage SO" + chr(10) + f"  Steuerfrei (> 1J):      {fmt_de(so_free_for_row):>12} EUR" + chr(10)}═══════════════════════════════════════════════════
+{"" if not (has_etf_data and invstg_aktiv) else chr(10) + "ANLAGE KAP-INV EINTRAGUNGEN" + chr(10) + f"  KAP-INV Erträge (nach TFS): {fmt_de(final['etf_net_taxable']):>8} EUR" + chr(10) + f"  KAP-INV QSt anrechenbar: {fmt_de(final['etf_wht']):>10} EUR" + chr(10)}{"" if not has_so_data else chr(10) + "ANLAGE SO (§23 EStG) — PRIVATE VERÄUSSERUNGSGESCHÄFTE" + chr(10) + f"  Physische Gold-ETCs (BFH VIII R 4/15)" + chr(10) + f"  Steuerpflichtig (≤ 1J): {fmt_de(so_taxable_for_row):>12} EUR  → Anlage SO" + chr(10) + f"  Steuerfrei (> 1J):      {fmt_de(so_free_for_row):>12} EUR" + chr(10)}═══════════════════════════════════════════════════
 """
 
 st.download_button(

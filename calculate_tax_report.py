@@ -25,6 +25,14 @@ def safe_float(val, default=0.0):
         return default
     return float(val)
 
+def get_kap_inv_wht_for_reporting(kap_inv):
+    """Return KAP-INV withholding tax after Teilfreistellung, with legacy fallback."""
+    if not kap_inv:
+        return 0.0
+    if 'etf_wht_anrechenbar_eur' in kap_inv:
+        return safe_float(kap_inv.get('etf_wht_anrechenbar_eur'))
+    return safe_float(kap_inv.get('etf_wht_eur'))
+
 GERMAN_DIVIDEND_TAX_TOTAL_RATE = 0.26375
 GERMAN_KEST_RATE = 0.25
 GERMAN_SOLI_RATE = 0.01375
@@ -3206,7 +3214,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         if abs(tfs_reduction) > 0.01:
             print(f"    Teilfreistellung:      {-tfs_reduction:>12,.2f} EUR")
         print(f"    ETF-Netto (stpfl.):    {etf_net_taxable:>12,.2f} EUR")
-        print(f"    ETF-Quellensteuer:     {etf_wht_abs:>12,.2f} EUR")
+        print(f"    ETF-QSt (roh):         {etf_wht_abs:>12,.2f} EUR")
+        print(f"    ETF-QSt anrechenbar:   {etf_wht_anrechenbar:>12,.2f} EUR")
 
     if anlage_so_result['details'] or anlage_so_result['total_gain'] != 0 or anlage_so_result['total_loss'] != 0:
         print("-" * 60)

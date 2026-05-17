@@ -62,32 +62,58 @@ def extract_trades_from_root(root):
 def extract_fx_multi_xml(xml_files, output_dir):
     """Extract and merge FX transactions and trades from multiple XML files (multi-year).
 
-    The main XML (last file) is used for all standard sections (trades, funds, etc.).
-    FX transactions and trades are merged from ALL files for complete FIFO lot history
-    and Stillhalter matching across years.
+    Single tax-year XML: the latest XML is used for standard sections.
+    Split tax-year XMLs: all XMLs touching the latest year are fully merged.
+    Prior-year XMLs only contribute trades, FX transactions and ConversionRates for
+    FIFO lot history and Stillhalter matching across years.
     """
     if not xml_files:
         return
 
-    # Detect tax year from XML content (FlexStatement toDate) to find the main XML
-    def get_xml_end_date(path):
+    # Detect tax year from XML content (FlexStatement toDate) to find the main XML.
+    def get_xml_period(path):
         try:
             t = ET.parse(path)
             stmt = t.getroot().find('.//FlexStatement')
             if stmt is not None:
-                return stmt.attrib.get('toDate', '')
+                return {
+                    'path': path,
+                    'from_date': stmt.attrib.get('fromDate', ''),
+                    'to_date': stmt.attrib.get('toDate', ''),
+                }
         except Exception:
             pass
-        return ''
+        return {'path': path, 'from_date': '', 'to_date': ''}
 
-    xml_files = sorted(xml_files, key=lambda p: get_xml_end_date(p))
-    main_xml = xml_files[-1]  # Latest end date = tax year
-    history_xmls = xml_files[:-1]
+    xml_periods = sorted(
+        (get_xml_period(p) for p in xml_files),
+        key=lambda x: (x['to_date'], x['from_date'], x['path'])
+    )
+    xml_files = [x['path'] for x in xml_periods]
+    latest = xml_periods[-1]
+    tax_year = latest['to_date'][:4] if latest['to_date'] else ''
+    main_xml = latest['path']  # Latest end date = tax year
+
+    if tax_year:
+        tax_year_xmls = [
+            x['path'] for x in xml_periods
+            if x['from_date'][:4] == tax_year or x['to_date'][:4] == tax_year
+        ]
+    else:
+        tax_year_xmls = [main_xml]
+    tax_year_paths = set(tax_year_xmls)
+    history_xmls = [x['path'] for x in xml_periods if x['path'] not in tax_year_paths]
 
     print(f"Multi-XML: {len(xml_files)} Dateien, Haupt-XML: {os.path.basename(main_xml)}")
 
-    # 1. Parse main XML normally (all standard sections)
-    parse_ibkr_xml(main_xml, output_dir)
+    # 1. Parse the tax-year XMLs. If the tax year is split across several
+    # exports, merge all normal sections from those files. Prior years remain
+    # history-only and are merged below for Stillhalter/FX context.
+    if len(tax_year_xmls) > 1:
+        print(f"  Steuerjahr {tax_year}: {len(tax_year_xmls)} XMLs werden voll gemergt")
+        extract_quarterly_xmls(tax_year_xmls, output_dir)
+    else:
+        parse_ibkr_xml(main_xml, output_dir)
 
     # 2. Detect base currency from main XML
     tree = ET.parse(main_xml)

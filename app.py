@@ -715,6 +715,14 @@ if accounts_skipped:
 </div>
 """, unsafe_allow_html=True)
 
+csv_enabled = ibkr_csv_file is not None and len(accounts_to_process) == 1
+if ibkr_csv_file is not None and not csv_enabled:
+    st.warning(
+        "Der CSV-Plausibilitätscheck und FX-CSV-Fallback werden bei mehreren "
+        "Konten deaktiviert. Bitte entweder nur ein Konto mit passendem CSV "
+        "prüfen oder pro Konto separat rechnen."
+    )
+
 # Show quarterly merge info
 for acct_id, xmls in accounts_to_process.items():
     if all(x.get('is_quarterly') for x in xmls) and len(xmls) > 1:
@@ -739,9 +747,9 @@ with st.spinner("Berechne Steuerreport…"):
         acct_label = main_xml['account_name'] or acct_id
 
         with tempfile.TemporaryDirectory() as tmp:
-            # Save CSV report (only for first account)
+            # CSV report is only safe for a single processed account.
             csv_report_path = None
-            if ibkr_csv_file is not None and len(reports) == 0:
+            if csv_enabled:
                 csv_report_path = os.path.join(tmp, "ibkr_report.csv")
                 with open(csv_report_path, "wb") as f:
                     f.write(ibkr_csv_file.getbuffer())

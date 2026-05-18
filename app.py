@@ -698,7 +698,9 @@ if len(accounts) > 1:
         name = xmls[-1]['account_name'] or acct_id
         years = f"{xmls[0]['from_date'][:4]}–{xmls[-1]['to_date'][:4]}" if len(xmls) > 1 else xmls[0]['to_date'][:4]
         acct_info.append(f"<strong>{name}</strong> ({acct_id}, {len(xmls)} XML{'s' if len(xmls)>1 else ''}, {years})")
-    msg = f"<strong style=\"color: #818cf8;\">{len(accounts_to_process)} Konto{'n' if len(accounts_to_process)>1 else ''} für {global_tax_year}</strong>"
+    account_count = len(accounts_to_process)
+    account_label = "Konten" if account_count > 1 else "Konto"
+    msg = f"<strong style=\"color: #818cf8;\">{account_count} {account_label} für {global_tax_year}</strong>"
     if accounts_skipped:
         msg += f" — {len(accounts_skipped)} übersprungen (kein {global_tax_year}-XML)"
     st.markdown(f"""

@@ -989,6 +989,30 @@ if abs(fx_corr_total) > 0.01:
         tageskurs_kapinv_corr_raw = 0
         tageskurs_kapinv_corr = 0
 
+# ── DE-Dividenden Variante B (für Software ohne Steuerbescheinigung-Flow) ───
+# Manche Steuerprogramme (WISO, Buhl, taxfix) schalten Z7/Z37/Z38 nur frei,
+# wenn eine deutsche Steuerbescheinigung nach §45a EStG vorliegt. IBKR liefert
+# diese nicht, obwohl die deutsche Verwahrstelle KESt+Soli auf DE-ISINs einbehält.
+# Variante B verschiebt die Werte nach Z19/Z41 — FA-seitig akzeptierter Workaround.
+de_kest_variante_b = False
+if abs(zeile_7) > 0.01:
+    st.markdown(f"""
+<div style="background: rgba(56,189,248,0.08); border: 1px solid rgba(56,189,248,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8; line-height: 1.6;">
+    <strong style="color: #38bdf8;">Deutsche Dividenden erkannt:</strong>
+    {fmt_de(zeile_7)} EUR Bruttodividende + {fmt_de(zeile_37 + zeile_38)} EUR DE-KESt/Soli auf DE-ISINs (z.B. SAP, Allianz, Rheinmetall).
+    Die deutsche Verwahrstelle (Clearstream) hat 26,375&nbsp;% an der Quelle einbehalten — das ist <em>inländischer Steuerabzug</em> nach §43 EStG, auch wenn IBKR keine Steuerbescheinigung ausstellt.<br><br>
+    <strong style="color: #38bdf8;">Variante A (Default, tax-legally präzise):</strong> Eintragung in Z. 7 (brutto) + Z. 37 (KESt) + Z. 38 (Soli).<br>
+    <strong style="color: #38bdf8;">Variante B (Workaround):</strong> Manche Steuerprogramme schalten Z. 7/37/38 nur frei, wenn eine Steuerbescheinigung nach §45a EStG vorliegt. Für diesen Fall: Bruttodividende nach Z. 19, DE-KESt+Soli nach Z. 41 (FA-seitig akzeptiert).
+</div>
+""", unsafe_allow_html=True)
+    de_kest_variante_b = st.checkbox(
+        "Variante B: DE-KESt nach Zeile 19/41 verschieben",
+        value=False,
+        help="Aktivieren, falls dein Steuerprogramm Zeile 7/37/38 nicht freischaltet "
+             "(mangels Steuerbescheinigung). Die Bruttodividende wird dann zu Zeile 19 "
+             "addiert, die DE-KESt+Soli zu Zeile 41. Endergebnis identisch, beide Varianten "
+             "werden vom Finanzamt akzeptiert.")
+
 # ── Konsolidierte Toggle-bereinigte Werte (Single Source of Truth) ──────────
 # Wird von GUI-Metrics, KAP-INV-Hero und Text-Report gemeinsam genutzt.
 # ETF-Felder werden bei Bedarf nach der Override-UI aktualisiert.
@@ -1033,6 +1057,20 @@ final = {
     'etf_net_taxable': (kap_inv.get('etf_net_taxable_eur', 0) + tageskurs_kapinv_corr) if (has_etf_data and invstg_aktiv) else 0,
     'etf_wht':         calculate_tax_report.get_kap_inv_wht_for_reporting(kap_inv)      if (has_etf_data and invstg_aktiv) else 0,
 }
+
+if de_kest_variante_b and abs(final['zeile_7']) > 0.01:
+    # Variante B: DE-Dividenden werden fiktiv wie ausländische Erträge behandelt.
+    # Damit `zeile_19 = topf_1 + topf_2` invariant bleibt (Hero-Formel,
+    # Excel-Reconciliation, Multi-Account-Tabelle), wandert die Bruttodividende
+    # auch in dividends/topf_2 — die DE-KESt+Soli analog in quellensteuer (Z41).
+    final['dividends']     += final['zeile_7']
+    final['topf_2']        += final['zeile_7']
+    final['zeile_19']      += final['zeile_7']
+    final['quellensteuer'] += final['zeile_37'] + final['zeile_38']
+    final['zeile_7']  = 0
+    final['zeile_37'] = 0
+    final['zeile_38'] = 0
+
 created_at = _dt.now().strftime('%d.%m.%Y %H:%M')
 
 # ── Basiswährung ────────────────────────────────────────────────────────────
@@ -1144,9 +1182,11 @@ st.markdown(
 topf2_cats = d.get('topf2_by_category', {})
 if topf2_cats:
     with st.expander("Aufschlüsselung Topf 2"):
-        # Dividenden toggle-bereinigt: bei deaktiviertem InvStG fliessen ETF-Dividenden in Topf 2
-        div_eur = d.get('dividends_eur', 0) + (kap_inv.get('etf_dividends_raw_eur', 0) if (has_etf_data and not invstg_aktiv) else 0)
-        int_eur = d.get('interest_eur', 0)
+        # Toggle-bereinigt aus final: ETF-Reintegration (InvStG aus) und DE-Dividenden
+        # (Variante B) sind dort bereits eingerechnet. Damit stimmt der Saldo der
+        # Aufschlüsselung mit der Topf-2-Metric-Card und dem Hero überein.
+        div_eur = final['dividends']
+        int_eur = final['interest']
         cat_table = "| Gattung | Gewinne | Verluste | Netto |\n|---------|--------:|---------:|------:|\n"
         if div_eur >= 0:
             cat_table += f"| Dividenden | {fmt_de(div_eur)} EUR | 0,00 EUR | {fmt_de(div_eur)} EUR |\n"
@@ -1988,6 +2028,13 @@ if has_so_data:
 
 st.markdown(kap_rows_html, unsafe_allow_html=True)
 
+if de_kest_variante_b and abs(zeile_7) > 0.01:
+    st.markdown(f"""
+<div style="background: rgba(56,189,248,0.06); border: 1px solid rgba(56,189,248,0.2); border-radius: 10px; padding: 0.6rem 1rem; margin-top: 0.5rem; margin-bottom: 1rem; font-size: 0.75rem; color: #94a3b8;">
+    <strong style="color: #38bdf8;">Variante B aktiv:</strong> {fmt_de(zeile_7)} EUR Bruttodividende auf DE-ISINs zu Z. 19 addiert · {fmt_de(zeile_37 + zeile_38)} EUR DE-KESt+Soli zu Z. 41 addiert.
+</div>
+""", unsafe_allow_html=True)
+
 # ── Multi-Account Breakdown ─────────────────────────────────────────────────
 
 if n_accounts > 1:
@@ -2002,6 +2049,11 @@ if n_accounts > 1:
             z37 = rep.get('zeile_37_kapitalertragsteuer_eur', 0)
             z38 = rep.get('zeile_38_solidaritaetszuschlag_eur', 0)
             z41 = rep.get('withholding_tax_eur', 0)
+            if de_kest_variante_b and abs(z7) > 0.01:
+                t2 += z7
+                z19 += z7
+                z41 += z37 + z38
+                z7 = z37 = z38 = 0
             label = f"Konto {idx+1} ({name})"
             acct_table += f"| {label} | {fmt_de(t1)} | {fmt_de(t2)} | {fmt_de(z7)} | {fmt_de(z19)} | {fmt_de(z37)} | {fmt_de(z38)} | {fmt_de(z41)} |\n"
         acct_table += f"| **Gesamt** | **{fmt_de(final['topf_1'])}** | **{fmt_de(final['topf_2'])}** | **{fmt_de(final['zeile_7'])}** | **{fmt_de(final['zeile_19'])}** | **{fmt_de(final['zeile_37'])}** | **{fmt_de(final['zeile_38'])}** | **{fmt_de(final['quellensteuer'])}** |\n"
@@ -2435,6 +2487,25 @@ if topf2_cats:
         else:
             topf2_detail_export += f"  {'Tageskurs-Korrektur':24s} G {fmt_de(0):>10} V {fmt_de(tk_corr_topf2):>10} N {fmt_de(tk_corr_topf2):>10} EUR\n"
 
+de_kest_export = ""
+if abs(zeile_7) > 0.01:
+    z_kest_total = zeile_37 + zeile_38
+    if de_kest_variante_b:
+        de_kest_export = (
+            "\nHINWEIS DEUTSCHE DIVIDENDEN (Variante B aktiv)\n"
+            f"  Bruttodividende {fmt_de(zeile_7)} EUR wurde nach Zeile 19 verschoben.\n"
+            f"  DE-KESt+Soli {fmt_de(z_kest_total)} EUR wurde nach Zeile 41 verschoben.\n"
+            "  Variante A (Z. 7/37/38) ist tax-legally präziser und im GUI umschaltbar.\n"
+        )
+    else:
+        de_kest_export = (
+            "\nHINWEIS DEUTSCHE DIVIDENDEN (Variante A aktiv)\n"
+            "  Falls dein Steuerprogramm Z. 7/37/38 nicht freischaltet, alternativ:\n"
+            f"    Zeile 19: +{fmt_de(zeile_7)} EUR  (Bruttodividende)\n"
+            f"    Zeile 41: +{fmt_de(z_kest_total)} EUR  (DE-KESt+Soli als anrechenbare Steuer)\n"
+            "  Beide Varianten sind FA-akzeptiert (Endergebnis identisch).\n"
+        )
+
 multi_acct_export = ""
 if n_accounts > 1:
     multi_acct_export = f"Konten: {n_accounts} (separat berechnet, Ergebnisse addiert)\n"
@@ -2466,7 +2537,7 @@ ANLAGE KAP EINTRAGUNGEN
   Zeile 22 (Verluste o. Aktien): {fmt_de(final['zeile_22']):>8} EUR
   Zeile 23 (Aktienverluste): {fmt_de(final['zeile_23']):>11} EUR
   Zeile 41 (ausl. Quellensteuer): {fmt_de(final['quellensteuer']):>8} EUR
-{"" if not (has_etf_data and invstg_aktiv) else chr(10) + "ANLAGE KAP-INV EINTRAGUNGEN" + chr(10) + f"  KAP-INV Erträge (nach TFS): {fmt_de(final['etf_net_taxable']):>8} EUR" + chr(10) + f"  KAP-INV QSt anrechenbar: {fmt_de(final['etf_wht']):>10} EUR" + chr(10)}{"" if not has_so_data else chr(10) + "ANLAGE SO (§23 EStG) — PRIVATE VERÄUSSERUNGSGESCHÄFTE" + chr(10) + f"  Physische Gold-ETCs (BFH VIII R 4/15)" + chr(10) + f"  Steuerpflichtig (≤ 1J): {fmt_de(so_taxable_for_row):>12} EUR  → Anlage SO" + chr(10) + f"  Steuerfrei (> 1J):      {fmt_de(so_free_for_row):>12} EUR" + chr(10)}═══════════════════════════════════════════════════
+{de_kest_export}{"" if not (has_etf_data and invstg_aktiv) else chr(10) + "ANLAGE KAP-INV EINTRAGUNGEN" + chr(10) + f"  KAP-INV Erträge (nach TFS): {fmt_de(final['etf_net_taxable']):>8} EUR" + chr(10) + f"  KAP-INV QSt anrechenbar: {fmt_de(final['etf_wht']):>10} EUR" + chr(10)}{"" if not has_so_data else chr(10) + "ANLAGE SO (§23 EStG) — PRIVATE VERÄUSSERUNGSGESCHÄFTE" + chr(10) + f"  Physische Gold-ETCs (BFH VIII R 4/15)" + chr(10) + f"  Steuerpflichtig (≤ 1J): {fmt_de(so_taxable_for_row):>12} EUR  → Anlage SO" + chr(10) + f"  Steuerfrei (> 1J):      {fmt_de(so_free_for_row):>12} EUR" + chr(10)}═══════════════════════════════════════════════════
 """
 
 st.download_button(

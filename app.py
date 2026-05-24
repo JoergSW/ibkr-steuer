@@ -2295,14 +2295,14 @@ Tageskurs-Methode: PnL (EUR) = Erlös × FX_Verkaufstag − AK × FX_Kauftag
 |---|---|---|---|
 | `STK` | `COMMON` / `REIT` / `ADR` | Aktienveräußerung (§20 Abs. 2 Nr. 1) | **Topf 1** |
 | `STK` | `ETF` (InvStG-Fonds) | Investmentfonds (InvStG §2) | **KAP-INV** (optional) |
-| `STK` | `ETF` (no\\_invstg, z.B. IBIT) | Wie Einzelaktie | **Topf 1** |
+| `STK` | `ETF` (no\\_invstg, z.B. IBIT, GLD) | Kein Investmentfonds i.S.d. InvStG (Sonstige Kapitalforderung, §20 Abs. 1 Nr. 7) | **Topf 2** |
 | `OPT` | | Termingeschäft, Option (§20 Abs. 2 Nr. 3) | Topf 2 |
 | `FUT` | | Termingeschäft, Future (§20 Abs. 2 Nr. 3) | Topf 2 |
 | `FOP` / `FSFOP` | | Termingeschäft, Future-Option (§20 Abs. 2 Nr. 3) | Topf 2 |
 | `BILL` | | Kapitalforderung, T-Bill (§20 Abs. 2 Nr. 7) | Topf 2 |
 | `BOND` | | Kapitalforderung, Anleihe (§20 Abs. 2 Nr. 7) | Topf 2 |
 
-**InvStG-Klassifizierung (optional):** ETFs mit `subCategory="ETF"` werden gegen eine Lookup-Tabelle (139 US-ETFs) geprüft. Aktienfonds (≥51% Aktienquote) erhalten 30% Teilfreistellung, sonstige Fonds 0%. Crypto/Commodity-ETPs (IBIT, GLD etc.) bleiben in Topf 1. Optionen auf ETFs bleiben in Topf 2.
+**InvStG-Klassifizierung (optional):** ETFs mit `subCategory="ETF"` werden gegen eine Lookup-Tabelle (139 US-ETFs) geprüft. Aktienfonds (≥51% Aktienquote) erhalten 30% Teilfreistellung, sonstige Fonds 0%. Crypto/Commodity-ETPs (IBIT, GLD etc.) sind keine Investmentfonds i.S.d. InvStG (keine Risikomischung, einzelner Basiswert) und landen in Topf 2 (§20 Abs. 1 Nr. 7 EStG). Optionen auf ETFs bleiben in Topf 2.
 
 **Jahresfilter:** Es wird `reportDate` verwendet, nicht `dateTime`. Grund: Trades am Jahresende (z.B. `dateTime=2024-12-29`, Settlement `reportDate=2025-01-02`) gehören steuerlich zum Settlement-Jahr (Zuflussprinzip §11 EStG).
 

@@ -32,6 +32,7 @@ SYNTHETIC_TESTS = [
     ("KAP-INV-WHT", "tests/test_kap_inv_wht.py"),
     ("KAP-INV-Tageskurs-TFS", "tests/test_kap_inv_tageskurs.py"),
     ("German-Dividend-Tax", "-m unittest tests/test_german_dividend_tax.py"),
+    ("FX-Margin-Negative-Balance", "tests/test_fx_negative_balance.py"),
 ]
 
 

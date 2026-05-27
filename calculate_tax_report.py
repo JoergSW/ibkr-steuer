@@ -4,7 +4,7 @@ import io
 import os
 import sys
 from datetime import datetime, timedelta
-from collections import defaultdict
+from collections import defaultdict, deque
 
 def load_csv(filepath):
     if not os.path.exists(filepath):
@@ -256,6 +256,185 @@ def parse_ibkr_csv_report(csv_path):
     }
 
 
+# --- FX Lot-Inventar mit Saldo-Tracking (Margin-Korrektur, Issue #59) ---
+#
+# Steuerrechtliche Grundlage: BMF 14.05.2025 Rn. 131 ordnet Währungsgewinne/
+# -verluste aus verzinslichem Fremdwährungsguthaben §20 Abs. 2 S. 1 Nr. 7
+# i.V.m. Abs. 4 S. 1 EStG zu. Eine Margin-Verbindlichkeit ist kein Guthaben:
+# Abflüsse aus negativem Saldo erzeugen keinen steuerbaren Vorgang, Zuflüsse auf
+# negatives Konto tilgen Schuld (keine Lot-Erzeugung bis Saldo positiv).
+#
+# Die Engine läuft zwei FIFO-Inventare parallel pro Währung:
+#   - `lots_corrected`: alle Cash-Events (inkl. BUY/SELL/ADJ) sichtbar, Saldo-Gate
+#     filtert PnL auf positiv-gedeckte Anteile. Gewählte Form für Topf 2.
+#   - `lots_raw`: alte Logik (BUY/SELL/ADJ unsichtbar, kein Saldo-Gate). Nur
+#     als Vergleichswert für UI/Plausibilität.
+
+_FX_PNL_OFF_CODES = frozenset({'BUY', 'SELL', 'ADJ', 'DINT', ''})
+_FX_LEGACY_SKIP_CODES = frozenset({'BUY', 'SELL', 'ADJ', ''})
+
+
+def _fx_event_sort_key(date_str, txid):
+    """Consistent ordering for same-day FX cash events."""
+    if not txid:
+        return (date_str, 0, 0, '')
+    try:
+        return (date_str, 0, int(txid), '')
+    except (TypeError, ValueError):
+        return (date_str, 1, 0, str(txid))
+
+
+def _add_fx_negative_days(day_set, start_date, end_date, tax_year):
+    """Add calendar days in tax_year for which a currency balance was negative."""
+    if not start_date or not end_date:
+        return
+    start = max(start_date, datetime(tax_year, 1, 1).date())
+    end = min(end_date, datetime(tax_year, 12, 31).date())
+    while start <= end:
+        day_set.add(start.isoformat())
+        start += timedelta(days=1)
+
+
+def _negative_days_from_balance_timeline(timeline_rows, starting_date_str, starting_balance, tax_year):
+    """Calendar days in tax_year where a balance was negative at any point."""
+    days = set()
+    last_date = parse_date(starting_date_str)
+    prev_balance = float(starting_balance or 0)
+
+    for d, _txid, _amt, _prev, after in timeline_rows:
+        current_date = parse_date(d)
+        if current_date:
+            if prev_balance < -0.01 and last_date:
+                _add_fx_negative_days(days, last_date, current_date, tax_year)
+            if after < -0.01:
+                _add_fx_negative_days(days, current_date, current_date, tax_year)
+            last_date = current_date
+        prev_balance = after
+
+    if prev_balance < -0.01 and last_date:
+        _add_fx_negative_days(days, last_date, datetime(tax_year, 12, 31).date(), tax_year)
+
+    return days
+
+
+def _init_fx_state(starting_balance, sb_date_str, sb_rate):
+    """State-Dict für eine Währung initialisieren."""
+    state = {
+        'balance': float(starting_balance or 0),
+        'lots_corrected': deque(),
+        'lots_raw': deque(),
+        'gain_corrected': 0.0,
+        'loss_corrected': 0.0,
+        'gain_raw': 0.0,
+        'loss_raw': 0.0,
+        'disposals_corrected': 0,
+        'disposals_raw': 0,
+        'days_negative': set(),
+        'last_balance_date': parse_date(sb_date_str),
+    }
+    # Positive Anfangsbestände ohne brauchbare Rate bleiben als unbewertete Lots
+    # im FIFO. So blockieren sie spätere, jüngere Lots korrekt, erzeugen aber keinen
+    # Phantom-PnL aus einem erfundenen Kurs.
+    if state['balance'] > 0.01:
+        lot_rate = sb_rate if sb_rate and sb_rate > 0 else None
+        state['lots_corrected'].append([sb_date_str, state['balance'], lot_rate])
+        state['lots_raw'].append([sb_date_str, state['balance'], lot_rate])
+    return state
+
+
+def _process_fx_event(state, date_str, amount, fx, activity_code, tax_year):
+    """Verarbeitet ein FX-Event; mutiert state.
+
+    Wichtig: Der corrected-Pfad sieht ALLE Events (inkl. BUY/SELL/ADJ), damit das
+    Lot-Inventar dem realen Cash-Saldo folgt. PnL-Buchung wird per activity_code
+    gated:
+      - BUY/SELL/ADJ/DINT/leer: Lots werden konsumiert/erzeugt, aber kein FX-PnL gebucht
+        (BUY/SELL: FX-Effekt liegt in fifoPnlRealized + Tageskurs-Korrektur;
+         ADJ: in Future-fifoPnlRealized;
+         DINT: Schuldzinsen sind keine Veräußerung von Fremdwährungsguthaben).
+      - Alle anderen Codes (DIV, FRTAX, FOREX, CINT, PIL, DEP, WITH, INTR, INTP,
+        OFEE, CORP): Lot-Konsum/Erzeugung UND PnL-Buchung.
+    """
+    allow_pnl_corrected = activity_code not in _FX_PNL_OFF_CODES
+    skip_legacy = activity_code in _FX_LEGACY_SKIP_CODES
+    event_rate = fx if fx and fx > 0 else None
+
+    date = parse_date(date_str)
+    in_tax_year = bool(date) and date.year == tax_year
+    prev = state['balance']
+
+    if date and prev < -0.01 and state.get('last_balance_date'):
+        _add_fx_negative_days(state['days_negative'], state['last_balance_date'], date, tax_year)
+
+    state['balance'] = prev + amount
+
+    if date and state['balance'] < -0.01:
+        _add_fx_negative_days(state['days_negative'], date, date, tax_year)
+    if date:
+        state['last_balance_date'] = date
+
+    # --- Raw-Pfad (alte Logik, nur PnL-Events, kein Saldo-Gate) ---
+    if not skip_legacy:
+        if amount > 0:
+            state['lots_raw'].append([date_str, amount, event_rate])
+        else:
+            remaining = abs(amount)
+            while remaining > 0.001 and state['lots_raw']:
+                lot_date, lot_qty, lot_rate = state['lots_raw'][0]
+                take = min(remaining, lot_qty)
+                if in_tax_year and event_rate is not None and lot_rate is not None:
+                    pnl = take * (event_rate - lot_rate)
+                    if pnl > 0:
+                        state['gain_raw'] += pnl
+                    else:
+                        state['loss_raw'] += pnl
+                    state['disposals_raw'] += 1
+                remaining -= take
+                lot_qty -= take
+                if lot_qty < 0.001:
+                    state['lots_raw'].popleft()
+                else:
+                    state['lots_raw'][0][1] = lot_qty
+
+    # --- Corrected-Pfad (alle Events, Saldo-Gate) ---
+    if amount > 0:
+        # Zufluss: Erst Schuld tilgen, Rest wird FIFO-Lot
+        tilgung = max(0.0, min(amount, -prev))
+        lot_amount = amount - tilgung
+        if lot_amount > 0.001:
+            state['lots_corrected'].append([date_str, lot_amount, event_rate])
+    else:
+        # Abfluss
+        if prev <= 0:
+            # Alles aus Schuld → kein steuerbarer Vorgang, kein Lot-Konsum
+            return
+        from_credit = min(abs(amount), prev)
+        remaining = from_credit
+        while remaining > 0.001 and state['lots_corrected']:
+            lot_date, lot_qty, lot_rate = state['lots_corrected'][0]
+            take = min(remaining, lot_qty)
+            if allow_pnl_corrected and in_tax_year and event_rate is not None and lot_rate is not None:
+                pnl = take * (event_rate - lot_rate)
+                if pnl > 0:
+                    state['gain_corrected'] += pnl
+                else:
+                    state['loss_corrected'] += pnl
+                state['disposals_corrected'] += 1
+            remaining -= take
+            lot_qty -= take
+            if lot_qty < 0.001:
+                state['lots_corrected'].popleft()
+            else:
+                state['lots_corrected'][0][1] = lot_qty
+
+
+def _finalize_fx_state(state, tax_year):
+    """Extend negative-balance day count through tax-year end if still negative."""
+    last_date = state.get('last_balance_date')
+    if state['balance'] < -0.01 and last_date:
+        _add_fx_negative_days(state['days_negative'], last_date, datetime(tax_year, 12, 31).date(), tax_year)
+
+
 def calculate_fx_gains(trades, fx_transactions, tax_year, base_currency='EUR'):
     """
     Berechnet FIFO-basierte Fremdwährungs-Gewinne/Verluste pro Währung.
@@ -263,16 +442,19 @@ def calculate_fx_gains(trades, fx_transactions, tax_year, base_currency='EUR'):
     Verwendet fx_transactions.csv (StmtFunds Currency-Level) mit Raten-Substitution:
     - Einträge mit fxRateToBase ≈ 1.0 (unbrauchbar auf Aggregat-Ebene) erhalten
       den Tageskurs aus trades.csv (fxRateToBase der Trades an diesem Tag)
-    - BUY/SELL/ADJ werden übersprungen (deren FX-Effekt steckt in fifoPnlRealized)
-    - FOREX, DIV, FRTAX, Zinsen, Gebühren etc. werden als FX-Ereignisse getrackt
+    - BUY/SELL/ADJ werden im corrected-Pfad mit eingerechnet (Saldo + Lot-Inventar),
+      lösen aber keinen steuerlichen FX-PnL aus
+    - FOREX, DIV, FRTAX, Zinsen, Gebühren etc. werden als FX-Ereignisse mit
+      PnL-Buchung getrackt
 
     Lots werden über alle Jahre aufgebaut (Multi-Year-Support), aber Gewinne/Verluste
     werden nur für Abflüsse im tax_year gezählt.
 
     Returns:
-        dict per currency, float total_gain, float total_loss, bool has_prior_data
+        dict per currency (mit gain/loss/net + raw_gain/raw_loss + days_negative),
+        float total_gain (corrected), float total_loss (corrected),
+        bool has_prior_data
     """
-    from collections import defaultdict, deque
     import bisect
 
     # --- Build daily rate maps per currency from trades.csv ---
@@ -305,10 +487,10 @@ def calculate_fx_gains(trades, fx_transactions, tax_year, base_currency='EUR'):
             return cmap[sorted_d[-1]]
         return cmap[sorted_d[idx - 1]]  # use previous available day
 
-    # --- Process fx_transactions with rate substitution ---
-    skip_codes = {'BUY', 'SELL', 'ADJ', ''}
-
+    # --- Process fx_transactions: corrected-Pfad sieht ALLE Events, raw-Pfad
+    # nur PnL-relevante (alte Logik). Engine intern unterscheidet via activityCode. ---
     by_currency = defaultdict(list)
+    starting_balances = {}  # curr -> (balance, date_str, fx)
 
     # Detect multi-year data
     starting_balance_total = 0.0
@@ -326,19 +508,22 @@ def calculate_fx_gains(trades, fx_transactions, tax_year, base_currency='EUR'):
         activity_desc = tx.get('activityDescription', '')
         code = tx.get('activityCode', '')
 
-        # Starting Balance → seed lot (single-year mode or with rate substitution)
+        # Starting Balance → wird in starting_balances gesammelt (auch negative Werte,
+        # damit der Saldo-Tracker im corrected-Pfad mit der Schuld startet)
         if activity_desc == 'Starting Balance':
             balance = safe_float(tx.get('balance'), 0)
-            if balance > 0.01:
-                date_str = tx.get('date', '')
-                fx = safe_float(tx.get('fxRateToBase'), 0)
-                if fx <= 0 or abs(fx - 1.0) < 0.001:
-                    fx = get_daily_rate(curr, date_str[:10])
-                if fx > 0:
-                    by_currency[curr].append((date_str, balance, fx))
+            date_str = tx.get('date', '')
+            fx = safe_float(tx.get('fxRateToBase'), 0)
+            if fx <= 0 or abs(fx - 1.0) < 0.001:
+                fx = get_daily_rate(curr, date_str[:10])
+            # Kein Rate-Fallback auf 1.0 (würde bei positivem SB Phantom-PnL erzeugen).
+            # Bei fx<=0 wird ein unbewerteter Lot angelegt: FIFO-Reihenfolge und Saldo
+            # bleiben korrekt, PnL wird erst bei Events mit bekannter Basis gerechnet.
+            starting_balances[curr] = (balance, date_str, fx if fx > 0 else 0.0)
             continue
 
-        if code in skip_codes:
+        # Ending Balance: nicht verarbeiten
+        if activity_desc == 'Ending Balance':
             continue
 
         date_str = tx.get('date', '')
@@ -359,12 +544,12 @@ def calculate_fx_gains(trades, fx_transactions, tax_year, base_currency='EUR'):
                 if symbol.startswith('EUR.') and tp > 0:
                     fx = 1.0 / tp
 
-        if fx <= 0:
-            continue
+        txid = tx.get('transactionID', '')
+        # Auch ohne Rate muss der Saldo-Tracker das Event sehen. Die Engine führt
+        # solche Beträge als unbewertete Lots und unterdrückt nur die PnL-Buchung.
+        by_currency[curr].append((date_str, txid, amount, fx if fx > 0 else 0.0, code))
 
-        by_currency[curr].append((date_str, amount, fx))
-
-    # --- FIFO processing per currency ---
+    # --- Engine-Run per currency ---
     if has_prior_data:
         print(f"FX: Multi-Year-Daten erkannt. FIFO-Lots werden vollständig aufgebaut.")
     elif starting_balance_total > 0.01:
@@ -375,49 +560,40 @@ def calculate_fx_gains(trades, fx_transactions, tax_year, base_currency='EUR'):
     total_gain = 0.0
     total_loss = 0.0
 
-    for curr, events in sorted(by_currency.items()):
-        events.sort(key=lambda x: x[0])  # sort by date
+    for curr in sorted(by_currency.keys()):
+        events = sorted(by_currency[curr], key=lambda ev: _fx_event_sort_key(ev[0], ev[1]))
+        sb_balance, sb_date, sb_fx = starting_balances.get(curr, (0.0, '', 1.0))
+        state = _init_fx_state(sb_balance, sb_date, sb_fx)
 
-        lots = deque()
-        gain = 0.0
-        loss = 0.0
-        disposals = 0
+        for date_str, _txid, amount, fx, code in events:
+            _process_fx_event(state, date_str, amount, fx, code, tax_year)
+        _finalize_fx_state(state, tax_year)
 
-        for date_str, amount, fx in events:
-            if amount > 0:
-                lots.append([date_str, amount, fx])
-            else:
-                dispose_amount = abs(amount)
-                date = parse_date(date_str)
+        gain = state['gain_corrected']
+        loss = state['loss_corrected']
+        raw_gain = state['gain_raw']
+        raw_loss = state['loss_raw']
+        days_neg = len(state['days_negative'])
 
-                while dispose_amount > 0.001 and lots:
-                    lot_date, lot_remaining, lot_rate = lots[0]
-                    take = min(dispose_amount, lot_remaining)
-
-                    if date and date.year == tax_year:
-                        pnl = take * (fx - lot_rate)
-                        if pnl > 0:
-                            gain += pnl
-                        else:
-                            loss += pnl
-                        disposals += 1
-
-                    lot_remaining -= take
-                    dispose_amount -= take
-
-                    if lot_remaining < 0.001:
-                        lots.popleft()
-                    else:
-                        lots[0][1] = lot_remaining
-
-        net = gain + loss
-        if abs(gain) > 0.01 or abs(loss) > 0.01:
+        # Currency in results aufnehmen, wenn PnL existiert ODER Margin-Phasen vorlagen
+        # (auch ohne PnL relevant für UI-Anzeige der negativen Tage).
+        has_any = (abs(gain) > 0.01 or abs(loss) > 0.01
+                   or abs(raw_gain) > 0.01 or abs(raw_loss) > 0.01
+                   or days_neg > 0)
+        if has_any:
             results[curr] = {
                 'gain': gain,
                 'loss': loss,
-                'net': net,
-                'lots_remaining': len(lots),
-                'disposals_count': disposals,
+                'net': gain + loss,
+                'lots_remaining': len(state['lots_corrected']),
+                'disposals_count': state['disposals_corrected'],
+                'raw_gain': raw_gain,
+                'raw_loss': raw_loss,
+                'raw_net': raw_gain + raw_loss,
+                'raw_disposals_count': state['disposals_raw'],
+                'days_negative': days_neg,
+                'final_balance': state['balance'],
+                'starting_balance': sb_balance,
             }
             total_gain += gain
             total_loss += loss
@@ -693,7 +869,8 @@ def _put_assignment_lot_cost_correction_per_share(closed_lots, det, underlying, 
     return default_per_share
 
 
-def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrides=None):
+def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrides=None,
+                  fx_margin_correction_enabled=True):
     # 0. Detect base currency, tax year, and XML metadata from account_info.csv
     base_currency = 'EUR'  # default — most IBKR accounts for German tax filers are EUR-based
     xml_has_fx_data = False
@@ -2436,60 +2613,350 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         csv_category_totals = csv_data['category_totals']
         csv_income_totals = csv_data.get('income_totals', {})
 
+    # --- Saldo-Timeline aus fx_transactions.csv (Margin-Korrektur, Issue #59) ---
+    # Wird sowohl für Option A (Filter) als auch für Option B (Entwertung) gebraucht.
+    fx_tx_path = os.path.join(ib_tax_dir, 'fx_transactions.csv')
+    fx_balance_timeline = defaultdict(list)  # curr -> [(date, txid, amount, prev_balance, after_balance)]
+    fx_has_negative_balance = False
+    _curr_sbs = {}
+    _curr_sb_dates = {}
+    if os.path.exists(fx_tx_path):
+        _fx_tx_for_timeline = load_csv(fx_tx_path)
+        _curr_events = defaultdict(list)
+        for _tx in _fx_tx_for_timeline:
+            _curr = _tx.get('currency', '')
+            if not _curr:
+                continue
+            _desc = _tx.get('activityDescription', '')
+            if _desc == 'Starting Balance':
+                _curr_sbs[_curr] = safe_float(_tx.get('balance'), 0)
+                _curr_sb_dates[_curr] = _tx.get('date', '')
+                continue
+            if _desc == 'Ending Balance':
+                continue
+            _amt = safe_float(_tx.get('amount'), 0)
+            if abs(_amt) < 0.001:
+                continue
+            _d = _tx.get('date', '')
+            _txid = _tx.get('transactionID', '')
+            _curr_events[_curr].append((_d, _txid, _amt))
+        for _curr, _evs in _curr_events.items():
+            _evs.sort(key=lambda x: _fx_event_sort_key(x[0], x[1]))
+            _bal = float(_curr_sbs.get(_curr, 0.0))
+            for _d, _txid, _amt in _evs:
+                _prev = _bal
+                _bal += _amt
+                fx_balance_timeline[_curr].append((_d, _txid, _amt, _prev, _bal))
+            if _negative_days_from_balance_timeline(
+                    fx_balance_timeline[_curr],
+                    _curr_sb_dates.get(_curr, ''),
+                    _curr_sbs.get(_curr, 0.0),
+                    tax_year):
+                fx_has_negative_balance = True
+
+    def _lookup_balance_before_event(curr, target_date_short, target_qty, consumed_per_curr):
+        """Findet balance VOR einem Event in fx_realized_pnl.csv.
+
+        Match-Strategie (greedy mit per-Currency-consumed-Set):
+          1. Same date + same sign + |amount| ≈ |target_qty| → exakter prev-balance.
+          2. Kein Event am Target-Tag → Saldo nach letztem Event davor (EXAKT, weil
+             keine Events dazwischen).
+          3. Same-Day-Fallback: Events am Tag vorhanden, kein exakter |amount|-Match.
+             Hier ist der Tagesanfangs-Saldo (`first_prev`) nur asymmetrisch
+             belastbar:
+             - `first_prev ≤ 0` und alle Same-Sign-Outflows → unser tatsächlicher
+               prev bleibt für jeden Same-Sign-Outflow zwischenzeitlich ≤ 0
+               (jeder Outflow drückt nur weiter ins Minus). scale=0 ist sicher.
+             - `first_prev > 0` → der Tagesanfangs-Saldo ist eine OBERE Schranke
+               für den echten prev. Bei mehreren same-day-Outflows hat der echte
+               prev bereits Cash verbraucht, sodass `first_prev/|qty|` (partial)
+               systematisch zu großzügig wäre (besteuert mehr als nötig).
+               Codex-Hinweis 2026-05-27: prev_is_exact=False, IBKR-Rohwert behalten.
+             - Mixed-Sign-Tag → zwischenzeitliche Inflows könnten den Saldo
+               hochgezogen haben → in jedem Fall unsicher.
+
+        P2-2: consumed_per_curr ist dict[currency] → set[idx], damit Indices verschiedener
+        Currencies nicht kollidieren.
+        P2-3: target_qty trägt das Vorzeichen; gematched wird nur, wenn amt dasselbe
+        Vorzeichen hat — verhindert falsches Matching eines gleichgroßen Inflows auf
+        einen gesuchten Outflow.
+        Markiert gefundene Events als consumed.
+
+        Returns (prev_balance, matched_event_amount, prev_is_exact):
+            prev_is_exact=True → prev_balance darf ohne Vorbehalt für die scale-Logik
+                                 genutzt werden (exakter Match, No-Event-Tag oder
+                                 Same-Sign-Tag mit first_prev ≤ 0).
+            prev_is_exact=False → prev_balance ist eine Approximation; der Aufrufer
+                                  sollte nur den Counter bumpen, nicht skalieren.
+        """
+        timeline = fx_balance_timeline.get(curr, [])
+        if not timeline:
+            return None, None, False
+        consumed = consumed_per_curr.setdefault(curr, set())
+        target_abs = abs(target_qty)
+        target_sign = 1 if target_qty > 0 else -1
+
+        # 1) Exakter Match auf (date, same-sign, |amount|)
+        for idx, (d, txid, amt, prev, after) in enumerate(timeline):
+            if idx in consumed:
+                continue
+            if d != target_date_short:
+                continue
+            if amt * target_sign <= 0:  # opposite sign oder Null → kein Match
+                continue
+            if abs(abs(amt) - target_abs) < 0.01:
+                consumed.add(idx)
+                return prev, amt, True
+
+        # Sammle alle Events am Target-Tag (für Fall 3 oder Fall 2)
+        same_day_events = [ev for ev in timeline if ev[0] == target_date_short]
+
+        if same_day_events:
+            # 3) Same-Day-Fallback: erster prev des Tages
+            first_prev = same_day_events[0][3]
+            all_same_sign = all(ev[2] * target_sign > 0 for ev in same_day_events)
+            # Nur sicher, wenn der Tagesanfangs-Saldo bereits ≤ 0 ist (sichere untere
+            # Schranke für skipped_full). Bei first_prev > 0 würde same-day-Verbrauch
+            # durch andere unmatched Outflows die scale-Logik verfälschen → approx.
+            prev_is_exact = all_same_sign and first_prev <= 0
+            return first_prev, None, prev_is_exact
+
+        # 2) Kein Event am Target-Tag: Saldo NACH dem letzten Event davor ist exakt.
+        prev_after = float(timeline[0][3])
+        for d, txid, amt, prev, after in timeline:
+            if d < target_date_short:
+                prev_after = after
+            else:
+                break
+        return prev_after, None, True
+
     # Option A: Exact FX from XML FxTransactions (IBKR's own FIFO, per-transaction realizedPL)
+    # Mit Saldo-Korrektur (Issue #59): Abflüsse aus negativem Saldo erzeugen keinen
+    # steuerbaren FX-PnL; teilweise gedeckte Abflüsse werden proportional gekürzt.
     fx_pnl_path = os.path.join(ib_tax_dir, 'fx_realized_pnl.csv')
+    fx_option_a_meta = {}
     if not fx_results and os.path.exists(fx_pnl_path):
         fx_pnl_rows = load_csv(fx_pnl_path)
         fx_by_curr = {}
+        consumed_timeline_idx = {}  # P2-2: dict[currency] -> set[idx]
+        approx_matches = 0  # Events, für die nur Tagesanfangs-Saldo verfügbar war
+        skipped_full = 0    # Events aus negativem Saldo (kein PnL)
+        partial_count = 0   # Events mit proportionaler Kürzung
         for row in fx_pnl_rows:
             rd = parse_date(row.get('reportDate'))
             if not rd or rd.year != tax_year:
                 continue
             curr = row.get('fxCurrency', '')
             pnl_raw = safe_float(row.get('realizedPL'), 0)
+            qty = safe_float(row.get('quantity'), 0)
             if not curr or abs(pnl_raw) < 0.001:
                 continue
+
+            # Saldo-Korrektur nur bei Abflüssen (quantity < 0) anwenden.
+            # Zuflüsse erzeugen kein realizedPL > 0 in IBKRs FIFO (Lots werden gebildet, nicht aufgelöst).
+            # _lookup_balance_before_event liefert ein drittes Element prev_is_exact:
+            #   - True bei exaktem Match, No-Event-am-Tag oder Same-Sign-Tag → prev_bal
+            #     darf für die scale-Logik verwendet werden.
+            #   - False bei Mixed-Sign-Tag → IBKR-Rohwert stehen lassen (approx_matches),
+            #     damit ein durch zwischenzeitliche Inflows verfälschter prev nicht
+            #     zu Fehlkürzungen führt.
+            scale = 1.0
+            if qty < 0 and fx_balance_timeline.get(curr):
+                # P2-3: qty mit Vorzeichen übergeben, damit nur same-sign-Events matchen
+                prev_bal, matched_amt, prev_is_exact = _lookup_balance_before_event(
+                    curr, row.get('reportDate', '')[:10], qty, consumed_timeline_idx)
+                if not prev_is_exact or prev_bal is None:
+                    approx_matches += 1
+                elif prev_bal <= 0:
+                    scale = 0.0
+                    skipped_full += 1
+                elif prev_bal < abs(qty):
+                    scale = prev_bal / abs(qty)
+                    partial_count += 1
+
+            pnl_corrected_raw = pnl_raw * scale
+
             # EUR base: realizedPL already in EUR; USD base: realizedPL in USD → convert
             if base_currency == 'EUR':
-                pnl = pnl_raw
+                pnl = pnl_corrected_raw
+                pnl_raw_eur = pnl_raw
             else:
                 rate_eur = get_rate_for_date(rd, usd_to_eur_rates)
-                pnl = pnl_raw * rate_eur
+                pnl = pnl_corrected_raw * rate_eur
+                pnl_raw_eur = pnl_raw * rate_eur
             if curr not in fx_by_curr:
-                fx_by_curr[curr] = {'gain': 0, 'loss': 0, 'net': 0, 'lots_remaining': 0, 'disposals_count': 0}
+                fx_by_curr[curr] = {'gain': 0, 'loss': 0, 'net': 0, 'lots_remaining': 0, 'disposals_count': 0,
+                                    'raw_gain': 0.0, 'raw_loss': 0.0, 'raw_net': 0.0,
+                                    'raw_disposals_count': 0, 'days_negative': 0,
+                                    'final_balance': 0.0, 'starting_balance': 0.0}
             if pnl > 0:
                 fx_by_curr[curr]['gain'] += pnl
-            else:
+            elif pnl < 0:
                 fx_by_curr[curr]['loss'] += pnl
             fx_by_curr[curr]['net'] += pnl
-            fx_by_curr[curr]['disposals_count'] += 1
+            if abs(pnl) > 0.001:
+                fx_by_curr[curr]['disposals_count'] += 1
+            # Raw-Werte (ungefiltert) für Vergleich
+            if pnl_raw_eur > 0:
+                fx_by_curr[curr]['raw_gain'] += pnl_raw_eur
+            else:
+                fx_by_curr[curr]['raw_loss'] += pnl_raw_eur
+            fx_by_curr[curr]['raw_net'] += pnl_raw_eur
+            fx_by_curr[curr]['raw_disposals_count'] += 1
+
+        # Negative-Tage-Counter pro Währung aus Timeline ableiten. Currencies mit
+        # Margin-Phasen, aber ohne eigene PnL-Zeile, bleiben so in der UI sichtbar.
+        for curr in set(fx_by_curr.keys()) | set(fx_balance_timeline.keys()):
+            final_bal = 0.0
+            for d, txid, amt, prev, after in fx_balance_timeline.get(curr, []):
+                final_bal = after
+            neg_days = _negative_days_from_balance_timeline(
+                fx_balance_timeline.get(curr, []),
+                _curr_sb_dates.get(curr, ''),
+                _curr_sbs.get(curr, 0.0),
+                tax_year
+            )
+            if curr not in fx_by_curr and neg_days:
+                fx_by_curr[curr] = {'gain': 0, 'loss': 0, 'net': 0,
+                                    'lots_remaining': 0, 'disposals_count': 0,
+                                    'raw_gain': 0.0, 'raw_loss': 0.0, 'raw_net': 0.0,
+                                    'raw_disposals_count': 0, 'days_negative': 0,
+                                    'final_balance': 0.0, 'starting_balance': _curr_sbs.get(curr, 0.0)}
+            if curr not in fx_by_curr:
+                continue
+            fx_by_curr[curr]['days_negative'] = len(neg_days)
+            fx_by_curr[curr]['final_balance'] = final_bal
+            fx_by_curr[curr]['starting_balance'] = _curr_sbs.get(curr, 0.0)
+
+        for data in fx_by_curr.values():
+            data['corrected_gain'] = data.get('gain', 0.0)
+            data['corrected_loss'] = data.get('loss', 0.0)
+            data['corrected_net'] = data.get('net', 0.0)
+            data['corrected_disposals_count'] = data.get('disposals_count', 0)
+            if not fx_margin_correction_enabled:
+                data['gain'] = data.get('raw_gain', data.get('gain', 0.0))
+                data['loss'] = data.get('raw_loss', data.get('loss', 0.0))
+                data['net'] = data.get('raw_net', data.get('net', 0.0))
+                data['disposals_count'] = data.get('raw_disposals_count', data.get('disposals_count', 0))
+
         if fx_by_curr:
             fx_results = fx_by_curr
             fx_total_gain = sum(d['gain'] for d in fx_by_curr.values())
             fx_total_loss = sum(d['loss'] for d in fx_by_curr.values())
             fx_source = 'xml'
-            # USD base: IBKR tracks EUR as foreign currency, but from German tax perspective
-            # it's the USD that's foreign. Label accordingly.
+            fx_option_a_meta = {
+                'approx_matches': approx_matches,
+                'skipped_full': skipped_full,
+                'partial_count': partial_count,
+                'has_negative_balance': fx_has_negative_balance,
+                'correction_enabled': fx_margin_correction_enabled,
+                'corrected_total': sum(d.get('corrected_net', d.get('net', 0.0)) for d in fx_by_curr.values()),
+                'raw_total': sum(d.get('raw_net', d.get('net', 0.0)) for d in fx_by_curr.values()),
+            }
             fx_label = 'USD' if base_currency == 'USD' else '/'.join(fx_by_curr.keys())
             print(f"FX: Exakte Werte aus XML FxTransactions übernommen ({len(fx_pnl_rows)} Einträge).")
+            if (skipped_full or partial_count) and fx_margin_correction_enabled:
+                print(f"  Saldo-Korrektur aktiv: {skipped_full} Events aus Schuld (kein PnL), "
+                      f"{partial_count} proportional gekürzt, {approx_matches} approximative Matches.")
+            elif (skipped_full or partial_count) and not fx_margin_correction_enabled:
+                print(f"  Saldo-Korrektur deaktiviert: IBKR-Rohwerte übernommen "
+                      f"({skipped_full} Events aus Schuld, {partial_count} proportional wären betroffen).")
             if base_currency == 'USD':
                 print(f"  USD-Konto: FX-Gewinne/-Verluste aus EUR-Transaktionen (IBKR trackt EUR als Fremdwährung).")
 
     # Option B: Exact FX from IBKR CSV report (same data as XML FxTransactions)
+    # Achtung: Aggregierter Wert ohne Saldo-Differenzierung. Bei negativer Balance
+    # kann er nicht saldogetreu korrigiert werden. Standard: Option B ueberspringen
+    # und Option C nutzen. Opt-out: CSV-Rohwert bewusst uebernehmen, aber die
+    # Margin-Metadaten fuer die UI sichtbar halten.
     if not fx_results and fx_csv_path and os.path.exists(fx_csv_path) and base_currency == 'EUR':
-        fx_results = csv_data['fx_results']
-        fx_total_gain = csv_data['fx_total_gain']
-        fx_total_loss = csv_data['fx_total_loss']
-        fx_source = 'csv'
-        print(f"FX: Exakte Werte aus IBKR Standard-Bericht übernommen.")
+        if fx_has_negative_balance and fx_margin_correction_enabled:
+            print(f"FX: IBKR-CSV-Bericht übersprungen — negativer Währungssaldo im Steuerjahr erkannt, "
+                  f"Fallback auf FIFO mit Saldo-Korrektur (Issue #59).")
+        else:
+            fx_results = csv_data['fx_results']
+            for curr, data in fx_results.items():
+                data.setdefault('raw_gain', data.get('gain', 0.0))
+                data.setdefault('raw_loss', data.get('loss', 0.0))
+                data.setdefault('raw_net', data.get('net', 0.0))
+                data.setdefault('raw_disposals_count', data.get('disposals_count', 0))
+                data.setdefault('corrected_gain', data.get('gain', 0.0))
+                data.setdefault('corrected_loss', data.get('loss', 0.0))
+                data.setdefault('corrected_net', data.get('net', 0.0))
+                data.setdefault('corrected_disposals_count', data.get('disposals_count', 0))
+                if curr in fx_balance_timeline:
+                    neg_days = _negative_days_from_balance_timeline(
+                        fx_balance_timeline.get(curr, []),
+                        _curr_sb_dates.get(curr, ''),
+                        _curr_sbs.get(curr, 0.0),
+                        tax_year
+                    )
+                    data['days_negative'] = len(neg_days)
+            for curr, timeline in fx_balance_timeline.items():
+                neg_days = _negative_days_from_balance_timeline(
+                    timeline,
+                    _curr_sb_dates.get(curr, ''),
+                    _curr_sbs.get(curr, 0.0),
+                    tax_year
+                )
+                if neg_days and curr not in fx_results:
+                    fx_results[curr] = {
+                        'gain': 0.0, 'loss': 0.0, 'net': 0.0,
+                        'raw_gain': 0.0, 'raw_loss': 0.0, 'raw_net': 0.0,
+                        'corrected_gain': 0.0, 'corrected_loss': 0.0, 'corrected_net': 0.0,
+                        'lots_remaining': 0, 'disposals_count': 0,
+                        'raw_disposals_count': 0, 'corrected_disposals_count': 0,
+                        'days_negative': len(neg_days),
+                        'final_balance': timeline[-1][4] if timeline else _curr_sbs.get(curr, 0.0),
+                        'starting_balance': _curr_sbs.get(curr, 0.0),
+                    }
+            fx_total_gain = csv_data['fx_total_gain']
+            fx_total_loss = csv_data['fx_total_loss']
+            fx_source = 'csv'
+            fx_option_a_meta = {
+                'approx_matches': 0,
+                'skipped_full': 0,
+                'partial_count': 0,
+                'has_negative_balance': fx_has_negative_balance,
+                'correction_enabled': fx_margin_correction_enabled,
+                'csv_raw_only': fx_has_negative_balance and not fx_margin_correction_enabled,
+                'corrected_total': sum(d.get('corrected_net', d.get('net', 0.0)) for d in fx_results.values()),
+                'raw_total': sum(d.get('raw_net', d.get('net', 0.0)) for d in fx_results.values()),
+            }
+            if fx_has_negative_balance and not fx_margin_correction_enabled:
+                print(f"FX: IBKR-CSV-Rohwerte übernommen — Saldo-Korrektur ist deaktiviert.")
+            else:
+                print(f"FX: Exakte Werte aus IBKR Standard-Bericht übernommen.")
 
-    # Option C: FIFO approximation from fx_transactions.csv (least accurate)
+    # Option C: FIFO approximation from fx_transactions.csv (mit Saldo-Korrektur)
     fx_path = os.path.join(ib_tax_dir, 'fx_transactions.csv')
     if not fx_results and os.path.exists(fx_path) and base_currency == 'EUR':
         fx_transactions = load_csv(fx_path)
         fx_results, fx_total_gain, fx_total_loss, fx_has_prior_data = calculate_fx_gains(
             trades, fx_transactions, tax_year, base_currency
         )
+        for data in fx_results.values():
+            data['corrected_gain'] = data.get('gain', 0.0)
+            data['corrected_loss'] = data.get('loss', 0.0)
+            data['corrected_net'] = data.get('net', 0.0)
+            data['corrected_disposals_count'] = data.get('disposals_count', 0)
+            if not fx_margin_correction_enabled:
+                data['gain'] = data.get('raw_gain', data.get('gain', 0.0))
+                data['loss'] = data.get('raw_loss', data.get('loss', 0.0))
+                data['net'] = data.get('raw_net', data.get('net', 0.0))
+                data['disposals_count'] = data.get('raw_disposals_count', data.get('disposals_count', 0))
+        if not fx_margin_correction_enabled:
+            fx_total_gain = sum(d.get('gain', 0.0) for d in fx_results.values())
+            fx_total_loss = sum(d.get('loss', 0.0) for d in fx_results.values())
+        fx_option_a_meta = {
+            'approx_matches': 0,
+            'skipped_full': 0,
+            'partial_count': 0,
+            'has_negative_balance': fx_has_negative_balance,
+            'correction_enabled': fx_margin_correction_enabled,
+            'corrected_total': sum(d.get('corrected_net', d.get('net', 0.0)) for d in fx_results.values()),
+            'raw_total': sum(d.get('raw_net', d.get('net', 0.0)) for d in fx_results.values()),
+        }
         fx_source = 'fifo'
 
     if fx_results:
@@ -3121,6 +3588,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         "fx_translation": fx_translation,
         "fx_has_prior_data": fx_has_prior_data,
         "fx_source": fx_source,
+        # Issue #59: Saldo-Korrektur-Metadaten (Margin-Schulden)
+        "fx_option_a_meta": fx_option_a_meta,
+        "fx_has_negative_balance": fx_has_negative_balance,
+        "fx_margin_correction_enabled": fx_margin_correction_enabled,
         "xml_has_fx_data": xml_has_fx_data,
         "csv_category_totals": csv_category_totals,
         "csv_income_totals": csv_income_totals,

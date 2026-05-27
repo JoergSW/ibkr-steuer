@@ -391,6 +391,10 @@ def merge_report_data(reports):
     merged['has_trade_price'] = all(r.get('has_trade_price', False) for r in reports)
     merged['xml_has_fx_data'] = all(r.get('xml_has_fx_data', True) for r in reports)
     merged['fx_has_prior_data'] = all(r.get('fx_has_prior_data', False) for r in reports)
+    merged['fx_has_negative_balance'] = any(r.get('fx_has_negative_balance', False) for r in reports)
+    merged['fx_margin_correction_enabled'] = all(
+        r.get('fx_margin_correction_enabled', True) for r in reports
+    )
 
     # FX source
     sources = set(r.get('fx_source', 'none') for r in reports)
@@ -398,13 +402,57 @@ def merge_report_data(reports):
 
     # fx_results (by currency)
     merged_fx = {}
+    fx_sum_keys = (
+        'gain', 'loss', 'net',
+        'raw_gain', 'raw_loss', 'raw_net',
+        'corrected_gain', 'corrected_loss', 'corrected_net',
+        'disposals_count', 'raw_disposals_count', 'corrected_disposals_count',
+    )
     for r in reports:
         for curr, data in r.get('fx_results', {}).items():
             if curr not in merged_fx:
-                merged_fx[curr] = {'gain': 0, 'loss': 0, 'net': 0}
-            for k in ('gain', 'loss', 'net'):
+                merged_fx[curr] = {k: 0 for k in fx_sum_keys}
+                merged_fx[curr].update({
+                    'lots_remaining': 0,
+                    'days_negative': 0,
+                    'final_balance': 0,
+                    'starting_balance': 0,
+                })
+            for k in fx_sum_keys:
                 merged_fx[curr][k] += data.get(k, 0)
+            merged_fx[curr]['lots_remaining'] += data.get('lots_remaining', 0)
+            merged_fx[curr]['days_negative'] = max(
+                merged_fx[curr].get('days_negative', 0),
+                data.get('days_negative', 0)
+            )
+            merged_fx[curr]['final_balance'] += data.get('final_balance', 0)
+            merged_fx[curr]['starting_balance'] += data.get('starting_balance', 0)
     merged['fx_results'] = merged_fx
+
+    # Issue #59 metadata for multi-account UI.
+    meta_sum_keys = ('approx_matches', 'skipped_full', 'partial_count')
+    merged_meta = {k: 0 for k in meta_sum_keys}
+    merged_meta.update({
+        'has_negative_balance': merged['fx_has_negative_balance'],
+        'correction_enabled': merged['fx_margin_correction_enabled'],
+        'corrected_total': 0.0,
+        'raw_total': 0.0,
+        'csv_raw_only': False,
+    })
+    for r in reports:
+        meta = r.get('fx_option_a_meta', {}) or {}
+        for k in meta_sum_keys:
+            merged_meta[k] += meta.get(k, 0)
+        merged_meta['corrected_total'] += meta.get(
+            'corrected_total',
+            sum(d.get('corrected_net', d.get('net', 0.0)) for d in r.get('fx_results', {}).values())
+        )
+        merged_meta['raw_total'] += meta.get(
+            'raw_total',
+            sum(d.get('raw_net', d.get('net', 0.0)) for d in r.get('fx_results', {}).values())
+        )
+        merged_meta['csv_raw_only'] = merged_meta['csv_raw_only'] or meta.get('csv_raw_only', False)
+    merged['fx_option_a_meta'] = merged_meta
 
     # fx_mtm
     merged_mtm = {}
@@ -602,7 +650,7 @@ st.markdown('<p class="page-sub">Anlage KAP · Interactive Brokers Flex Query</p
 
 st.markdown("""
 <div style="background: rgba(251,191,36,0.06); border: 1px solid rgba(251,191,36,0.2); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 0.5rem; font-size: 0.78rem; color: #94a3b8; line-height: 1.6;">
-    <strong style="color: #fbbf24;">Wichtiger Hinweis:</strong> Dieses Tool dient ausschließlich als Hilfsmittel zur Aufbereitung von IBKR-Daten für die deutsche Steuererklärung. Es ersetzt keine steuerliche Beratung durch einen Steuerberater oder Wirtschaftsprüfer. Die Ergebnisse sind ohne Gewähr — eine Haftung für die Richtigkeit, Vollständigkeit oder Aktualität der berechneten Werte wird nicht übernommen. Insbesondere bei komplexen Sachverhalten (z.B. Verlustvorträge, Teilfreistellungen, gewerblicher Handel) sollte fachkundiger Rat eingeholt werden.<br><br>
+    <strong style="color: #fbbf24;">Wichtiger Hinweis:</strong> Dieses Tool dient ausschließlich als Hilfsmittel zur Aufbereitung von IBKR-Daten für die deutsche Steuererklärung. Es ersetzt keine steuerliche Beratung durch einen Steuerberater oder Wirtschaftsprüfer. Die Ergebnisse sind ohne Gewähr; eine Haftung für die Richtigkeit, Vollständigkeit oder Aktualität der berechneten Werte wird nicht übernommen. Insbesondere bei komplexen Sachverhalten (z.B. Verlustvorträge, Teilfreistellungen, gewerblicher Handel) sollte fachkundiger Rat eingeholt werden.<br><br>
     <strong style="color: #60a5fa;">Datenschutz:</strong> Alle Berechnungen erfolgen ausschließlich lokal. Es werden keine Daten an Server übertragen, gespeichert oder an Dritte weitergegeben.
 </div>
 """, unsafe_allow_html=True)
@@ -629,7 +677,7 @@ st.markdown("""
     <strong style="color: #34d399; font-size: 0.9rem;">2. IBKR Standard-Bericht CSV (Plausibilitätscheck)</strong><br>
     <strong style="color: #6ee7b7;">Automatischer Plausibilitätscheck:</strong>
     Der IBKR-Bericht enthält aggregierte Summen pro Kategorie (Aktien, Optionen, Futures, Anleihen, Devisen, Dividenden, Zinsen, Quellensteuer).
-    Diese werden automatisch mit unserer Einzelberechnung aus der Flex Query XML verglichen — cent-genaue Übereinstimmung ist das Ziel.<br><br>
+    Diese werden automatisch mit unserer Einzelberechnung aus der Flex Query XML verglichen. Cent-genaue Übereinstimmung ist das Ziel.<br><br>
     <strong style="color: #6ee7b7;">FX-Fallback:</strong>
     Falls Ihre Flex Query keine <code>FxTransactions</code>-Sektion enthält, liefert der CSV-Bericht die exakten Devisengewinne/-verluste als Ersatz.<br><br>
     <span style="background: rgba(16,185,129,0.12); border-radius: 6px; padding: 0.4rem 0.6rem; display: inline-block; margin-top: 0.2rem; color: #94a3b8;">
@@ -662,7 +710,7 @@ if multi_stmt_files:
         st.warning(
             f"**{f['name']}** enthält {len(f['account_ids'])} Konten "
             f"({', '.join(f['account_ids'])}). Es wird nur das erste Konto "
-            f"(**{f['account_ids'][0]}**) verarbeitet — die übrigen werden ignoriert. "
+            f"(**{f['account_ids'][0]}**) verarbeitet; die übrigen werden ignoriert. "
             f"Bitte pro Konto eine eigene Flex Query erstellen und einzeln hochladen."
         )
 
@@ -702,7 +750,7 @@ if len(accounts) > 1:
     account_label = "Konten" if account_count > 1 else "Konto"
     msg = f"<strong style=\"color: #818cf8;\">{account_count} {account_label} für {global_tax_year}</strong>"
     if accounts_skipped:
-        msg += f" — {len(accounts_skipped)} übersprungen (kein {global_tax_year}-XML)"
+        msg += f"; {len(accounts_skipped)} übersprungen (kein {global_tax_year}-XML)"
     st.markdown(f"""
 <div style="background: rgba(99,102,241,0.08); border: 1px solid rgba(99,102,241,0.25); border-radius: 10px; padding: 0.6rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
     {msg}<br>
@@ -713,7 +761,7 @@ if len(accounts) > 1:
 if accounts_skipped:
     st.markdown(f"""
 <div style="background: rgba(251,191,36,0.06); border: 1px solid rgba(251,191,36,0.2); border-radius: 10px; padding: 0.6rem 1rem; margin-bottom: 1rem; font-size: 0.78rem; color: #94a3b8;">
-    <strong style="color: #fbbf24;">Übersprungen:</strong> {', '.join(accounts_skipped)} — keine Daten für Steuerjahr {global_tax_year} vorhanden.
+    <strong style="color: #fbbf24;">Übersprungen:</strong> {', '.join(accounts_skipped)}: keine Daten für Steuerjahr {global_tax_year} vorhanden.
 </div>
 """, unsafe_allow_html=True)
 
@@ -725,6 +773,13 @@ if ibkr_csv_file is not None and not csv_enabled:
         "prüfen oder pro Konto separat rechnen."
     )
 
+# Das Widget sitzt weiter unten im FX-Block; die Berechnung braucht den Wert
+# aber schon hier. Streamlit aktualisiert st.session_state vor jedem Rerun.
+if 'fx_margin_correction_enabled' not in st.session_state:
+    st.session_state['fx_margin_correction_enabled'] = True
+fx_margin_correction_enabled = st.session_state['fx_margin_correction_enabled']
+
+
 # Show quarterly merge info
 for acct_id, xmls in accounts_to_process.items():
     if all(x.get('is_quarterly') for x in xmls) and len(xmls) > 1:
@@ -732,7 +787,7 @@ for acct_id, xmls in accounts_to_process.items():
         acct_label = xmls[-1]['account_name'] or acct_id
         st.markdown(f"""
 <div style="background: rgba(16,185,129,0.08); border: 1px solid rgba(16,185,129,0.25); border-radius: 10px; padding: 0.6rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
-    <strong style="color: #34d399;">{len(xmls)} Quartals-XMLs erkannt</strong> ({', '.join(periods)}) für {acct_label} — werden zu einem Jahresreport {global_tax_year} zusammengeführt.
+    <strong style="color: #34d399;">{len(xmls)} Quartals-XMLs erkannt</strong> ({', '.join(periods)}) für {acct_label}; werden zu einem Jahresreport {global_tax_year} zusammengeführt.
 </div>
 """, unsafe_allow_html=True)
 
@@ -788,6 +843,7 @@ with st.spinner("Berechne Steuerreport…"):
                     tmp,
                     fx_csv_path=csv_report_path,
                     anlage_so_overrides=st.session_state.get('anlage_so_overrides', []),
+                    fx_margin_correction_enabled=fx_margin_correction_enabled,
                 )
 
                 # Validate base currency consistency
@@ -1000,7 +1056,7 @@ if abs(zeile_7) > 0.01:
 <div style="background: rgba(56,189,248,0.08); border: 1px solid rgba(56,189,248,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8; line-height: 1.6;">
     <strong style="color: #38bdf8;">Deutsche Dividenden erkannt:</strong>
     {fmt_de(zeile_7)} EUR Bruttodividende + {fmt_de(zeile_37 + zeile_38)} EUR DE-KESt/Soli auf DE-ISINs (z.B. SAP, Allianz, Rheinmetall).
-    Die deutsche Verwahrstelle (Clearstream) hat 26,375&nbsp;% an der Quelle einbehalten — das ist <em>inländischer Steuerabzug</em> nach §43 EStG, auch wenn IBKR keine Steuerbescheinigung ausstellt.<br><br>
+    Die deutsche Verwahrstelle (Clearstream) hat 26,375&nbsp;% an der Quelle einbehalten; das ist <em>inländischer Steuerabzug</em> nach §43 EStG, auch wenn IBKR keine Steuerbescheinigung ausstellt.<br><br>
     <strong style="color: #38bdf8;">Variante A (Default, tax-legally präzise):</strong> Eintragung in Z. 7 (brutto) + Z. 37 (KESt) + Z. 38 (Soli).<br>
     <strong style="color: #38bdf8;">Variante B (Workaround):</strong> Manche Steuerprogramme schalten Z. 7/37/38 nur frei, wenn eine Steuerbescheinigung nach §45a EStG vorliegt. Für diesen Fall: Bruttodividende nach Z. 19, DE-KESt+Soli nach Z. 41 (FA-seitig akzeptiert).
 </div>
@@ -1079,14 +1135,14 @@ base_curr = d.get('base_currency', 'USD')
 base_icon = "🇪🇺" if base_curr == "EUR" else "🇺🇸"
 st.markdown(f"""
 <div style="background: rgba(99,102,241,0.08); border: 1px solid rgba(99,102,241,0.25); border-radius: 10px; padding: 0.6rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
-    {base_icon} <strong style="color: #818cf8;">Basiswährung: {base_curr}</strong> — {"Beträge in StmtFunds sind bereits in EUR (BaseCurrency-Ansicht)." if base_curr == "EUR" else "USD-Beträge werden über tägliche Wechselkurse in EUR umgerechnet."}
+    {base_icon} <strong style="color: #818cf8;">Basiswährung: {base_curr}</strong>: {"Beträge in StmtFunds sind bereits in EUR (BaseCurrency-Ansicht)." if base_curr == "EUR" else "USD-Beträge werden über tägliche Wechselkurse in EUR umgerechnet."}
 </div>
 """, unsafe_allow_html=True)
 
 if n_accounts > 1:
     st.markdown(f"""
 <div style="background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.25); border-radius: 10px; padding: 0.6rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
-    <strong style="color: #fbbf24;">{n_accounts} Konten zusammengeführt</strong> — Jedes Konto wurde separat berechnet, die Ergebnisse wurden addiert.
+    <strong style="color: #fbbf24;">{n_accounts} Konten zusammengeführt</strong>: Jedes Konto wurde separat berechnet, die Ergebnisse wurden addiert.
 </div>
 """, unsafe_allow_html=True)
 
@@ -1101,7 +1157,7 @@ if not xml_has_fx and fx_source != 'csv':
     <strong style="color: #fb923c; font-size: 0.9rem;">Flex Query unvollständig: Keine FX-Transaktionsdaten</strong><br>
     Ihre Flex Query XML enthält keine <code>FxTransactions</code>-Sektion. Ohne diese Daten können Fremdwährungs-Gewinne/-Verluste
     nur approximiert werden (FIFO-Schätzung mit eingeschränkter Genauigkeit).<br><br>
-    <strong style="color: #fdba74;">Lösung:</strong> Laden Sie den <strong>IBKR Standard-Bericht (CSV)</strong> oben hoch —
+    <strong style="color: #fdba74;">Lösung:</strong> Laden Sie den <strong>IBKR Standard-Bericht (CSV)</strong> oben hoch:
     dieser enthält die exakten Devisengewinne/-verluste, die IBKR intern per FIFO berechnet.<br>
     <span style="color: #94a3b8; font-size: 0.78rem;">
     Alternativ: In IBKR unter <em>Reports → Flex Queries → Configure</em> die Sektion
@@ -1229,6 +1285,23 @@ if fx_results:
     else:
         section_title("Fremdwährungs-Gewinne/Verluste (FIFO-Approximation)")
 
+    st.checkbox(
+        "FX-Saldo-Korrektur anwenden (§20 Abs. 2 S. 1 Nr. 7 EStG)",
+        key="fx_margin_correction_enabled",
+        help=(
+            "Empfohlen, aber konservativ. Behandelt negative Fremdwährungssalden als "
+            "Margin-Schuld: Abflüsse aus negativem Saldo erzeugen keinen steuerbaren "
+            "FX-Vorgang, weil BMF Rn. 131 nur das verzinsliche Fremdwährungs**guthaben** "
+            "erwähnt; eine Verbindlichkeit ist kein Guthaben.\n\n"
+            "Wirkt typischerweise zugunsten der Steuerschuld (filtert FX-Verluste stärker "
+            "raus als FX-Gewinne). Teile der Literatur (z.B. Krumm in K/S/M zu §20 EStG) "
+            "vertreten eine symmetrische Sicht; der BFH hat das nicht final entschieden.\n\n"
+            "Deaktivieren = IBKR-/Rohwerte übernehmen (möglicherweise höhere FX-Verluste, "
+            "aber auch höheres Diskussionsrisiko mit dem Finanzamt). Negative Salden "
+            "werden auch bei deaktivierter Korrektur weiterhin angezeigt."
+        ),
+    )
+
     st.markdown(
         '<div class="metric-grid">'
         + metric_card("FX Gewinne", fx_total_gain, "gain")
@@ -1238,12 +1311,164 @@ if fx_results:
         unsafe_allow_html=True
     )
 
+    # Issue #59: Saldo-Korrektur (Margin-Schulden).
+    fx_has_neg = d.get('fx_has_negative_balance', False)
+    fx_opt_a_meta = d.get('fx_option_a_meta', {}) or {}
+    correction_enabled = d.get(
+        'fx_margin_correction_enabled',
+        fx_opt_a_meta.get('correction_enabled', True)
+    )
+    has_raw_data = any('raw_net' in data for data in fx_results.values())
+    has_corrected_data = any('corrected_net' in data for data in fx_results.values())
+    active_total = fx_total_gain + fx_total_loss
+    raw_total = fx_opt_a_meta.get(
+        'raw_total',
+        sum(data.get('raw_net', data.get('net', 0.0)) for data in fx_results.values())
+    )
+    corrected_total = fx_opt_a_meta.get(
+        'corrected_total',
+        sum(data.get('corrected_net', data.get('net', 0.0)) for data in fx_results.values())
+    )
+    diff_corr_raw = corrected_total - raw_total
+    total_neg_days = max((data.get('days_negative', 0) for data in fx_results.values()), default=0)
+
+    if (has_raw_data or has_corrected_data) and (fx_has_neg or abs(diff_corr_raw) > 0.01):
+        skipped = fx_opt_a_meta.get('skipped_full', 0)
+        partial = fx_opt_a_meta.get('partial_count', 0)
+        approx = fx_opt_a_meta.get('approx_matches', 0)
+
+        accent = "#fb923c" if (abs(diff_corr_raw) > 50.0 or total_neg_days > 30) else "#6ee7b7"
+        raw_label = "IBKR-Rohwert vor Saldo-Prüfung" if fx_source == 'xml' else "Rohwert vor Saldo-Prüfung"
+        comparison_label = "gegenüber IBKR" if fx_source == 'xml' else "gegenüber dem Rohwert"
+        approx_label = "IBKR-FX-Zeilen" if fx_source == 'xml' else "FX-Zeilen"
+        unchanged_label = "IBKR-Wert" if fx_source == 'xml' else "Rohwert"
+
+        # Welche Währungen waren im Minus?
+        neg_currs = [c for c, dt in fx_results.items() if dt.get('days_negative', 0) > 0]
+        if len(neg_currs) == 1:
+            curr_label = f"{neg_currs[0]}-Konto"
+        elif neg_currs:
+            curr_label = f"{' / '.join(neg_currs)}-Konten"
+        else:
+            curr_label = "Fremdwährungskonto"
+
+        if abs(diff_corr_raw) > 0.005:
+            effect_word = "erhöht" if diff_corr_raw > 0 else "reduziert"
+            if correction_enabled:
+                correction_html = (
+                    f'Die Saldo-Prüfung {effect_word} den Topf-2-FX-Wert {comparison_label} um '
+                    f'<strong>{fmt_de(abs(diff_corr_raw))} EUR</strong>.'
+                )
+            else:
+                correction_html = (
+                    f'Bei aktivierter Saldo-Prüfung läge der Topf-2-FX-Wert {comparison_label} um '
+                    f'<strong>{fmt_de(abs(diff_corr_raw))} EUR</strong> '
+                    f'{"höher" if diff_corr_raw > 0 else "niedriger"}.'
+                )
+        else:
+            correction_html = f'Die Saldo-Prüfung ändert den {unchanged_label} rechnerisch nicht.'
+
+        details_parts = []
+        if skipped:
+            if correction_enabled:
+                details_parts.append(
+                    f"<strong>{skipped}</strong> Abflüsse waren vollständig aus Margin-Schuld bezahlt "
+                    f"und wurden nicht als steuerbarer FX-Vorgang gezählt"
+                )
+            else:
+                details_parts.append(
+                    f"<strong>{skipped}</strong> Abflüsse wären bei aktivierter Korrektur vollständig "
+                    f"als Margin-Schuld behandelt und nicht als steuerbarer FX-Vorgang gezählt"
+                )
+        if partial:
+            if correction_enabled:
+                details_parts.append(
+                    f"<strong>{partial}</strong> Abflüsse waren nur teilweise durch Guthaben gedeckt "
+                    f"und wurden anteilig berücksichtigt"
+                )
+            else:
+                details_parts.append(
+                    f"<strong>{partial}</strong> Abflüsse wären bei aktivierter Korrektur nur anteilig "
+                    f"berücksichtigt, weil sie teilweise aus Margin-Schuld bezahlt wurden"
+                )
+        if approx:
+            if correction_enabled:
+                details_parts.append(
+                    f"<strong>{approx}</strong> {approx_label} ließen sich nicht eindeutig einem Cash-Event zuordnen; "
+                    f"diese Zeilen blieben mit dem {unchanged_label} unverändert"
+                )
+            else:
+                details_parts.append(
+                    f"<strong>{approx}</strong> {approx_label} wären auch bei aktivierter Korrektur nicht eindeutig "
+                    f"einem Cash-Event zuordenbar; dort bliebe der {unchanged_label} unverändert"
+                )
+
+        details_html = ''
+        if details_parts:
+            details_html = (
+                '<div style="margin-top: 0.7rem; font-size: 0.85rem; color: #94a3b8; line-height: 1.6;">'
+                + '<br>'.join('• ' + p for p in details_parts)
+                + '</div>'
+            )
+
+        st.markdown(
+            f'<div style="background: rgba(251, 146, 60, 0.06); border-left: 3px solid {accent}; '
+            f'padding: 0.95rem 1.15rem; margin: 0.6rem 0; border-radius: 0 8px 8px 0;">'
+            f'<div style="color: {accent}; font-weight: 600; margin-bottom: 0.45rem; font-size: 0.98rem;">'
+            f'{"FX-Saldo-Korrektur" if correction_enabled else "FX-Saldo-Korrektur deaktiviert"}: '
+            f'{curr_label} war zeitweise im Minus</div>'
+            f'<div style="font-size: 0.92rem; color: #cbd5e1; line-height: 1.6;">'
+            f'An <strong>{total_neg_days} Tagen</strong> im Steuerjahr war der Fremdwährungssaldo negativ. '
+            f'Das ist steuerlich Margin-Schuld, nicht Fremdwährungsguthaben. '
+            f'Steuerbar sind Währungsgewinne/-verluste aus verzinslichem Fremdwährungsguthaben '
+            f'(§20 Abs. 2 S. 1 Nr. 7 i.V.m. Abs. 4 S. 1 EStG, BMF 14.05.2025 Rn. 131). '
+            + (
+                'Deshalb rechnet das Tool Tilgungen einer Fremdwährungs-Schuld heraus.'
+                if correction_enabled
+                else 'Die Korrektur ist aktuell deaktiviert; Topf 2 übernimmt den Rohwert.'
+            )
+            + f'</div>'
+            + f'<div style="margin-top: 0.75rem; padding-top: 0.7rem; border-top: 1px solid rgba(255,255,255,0.08); '
+            f'font-size: 0.92rem; line-height: 1.6;">'
+            f'<div>In Topf 2 übernommener FX-Wert: '
+            f'<strong style="color: #34d399;">{fmt_de(active_total)} EUR</strong> '
+            f'<span style="color: #94a3b8;">'
+            f'{"nach Saldo-Prüfung" if correction_enabled else "ohne Saldo-Prüfung (Opt-out aktiv)"}'
+            f'</span></div>'
+            + (
+                f'<div style="color: #94a3b8;">{raw_label}: {fmt_de(raw_total)} EUR</div>'
+                if correction_enabled
+                else f'<div style="color: #94a3b8;">Wert mit Saldo-Prüfung: {fmt_de(corrected_total)} EUR</div>'
+            )
+            + f'<div style="color: #94a3b8;">{correction_html}</div>'
+            f'</div>'
+            f'{details_html}'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+
     with st.expander("Details pro Währung"):
-        fx_table = "| Währung | Gewinn | Verlust | Netto | MTM (Vergleich) |\n|---------|--------|---------|-------|----------------|\n"
-        for curr, data in sorted(fx_results.items()):
-            mtm_val = fx_mtm.get(curr)
-            mtm_str = f"{fmt_de(mtm_val)} EUR" if mtm_val is not None else "-"
-            fx_table += f"| {curr} | {fmt_de(data['gain'])} | {fmt_de(data['loss'])} | {fmt_de(data['net'])} | {mtm_str} |\n"
+        has_raw_col = any('raw_net' in data for data in fx_results.values())
+        if has_raw_col:
+            raw_col = "IBKR-Roh" if fx_source == 'xml' else "Roh"
+            fx_table = (f"| Währung | Verwendet | Korrigiert | {raw_col} | Korr.-Raw | Neg.-Tage | MTM |\n"
+                        "|---------|----------:|-----------:|---------:|----------:|----------:|----:|\n")
+            for curr, data in sorted(fx_results.items()):
+                mtm_val = fx_mtm.get(curr)
+                mtm_str = f"{fmt_de(mtm_val)}" if mtm_val is not None else "-"
+                used_net = data.get('net', 0)
+                corr_net = data.get('corrected_net', used_net)
+                raw_net = data.get('raw_net', corr_net)
+                diff = corr_net - raw_net
+                neg_d = data.get('days_negative', 0)
+                fx_table += (f"| {curr} | {fmt_de(used_net)} | {fmt_de(corr_net)} | {fmt_de(raw_net)} | "
+                             f"{fmt_de(diff)} | {neg_d} | {mtm_str} |\n")
+        else:
+            fx_table = "| Währung | Gewinn | Verlust | Netto | MTM (Vergleich) |\n|---------|--------|---------|-------|----------------|\n"
+            for curr, data in sorted(fx_results.items()):
+                mtm_val = fx_mtm.get(curr)
+                mtm_str = f"{fmt_de(mtm_val)} EUR" if mtm_val is not None else "-"
+                fx_table += f"| {curr} | {fmt_de(data['gain'])} | {fmt_de(data['loss'])} | {fmt_de(data['net'])} | {mtm_str} |\n"
         st.markdown(fx_table)
         fx_tgl = d.get('fx_translation', 0)
         if fx_tgl != 0:
@@ -1255,7 +1480,7 @@ if fx_results:
         else:
             no_xml_fx = not d.get('xml_has_fx_data', True)
             fx_prior = d.get('fx_has_prior_data', False)
-            extra = (" Die Flex Query enthält keine FxTransactions — "
+            extra = (" Die Flex Query enthält keine FxTransactions. "
                      "Kursgenauigkeit der Approximation ist eingeschränkt.") if no_xml_fx else ""
             if fx_prior:
                 st.warning(f"FIFO-Approximation aus Flex Query (Tagesraten-Substitution).{extra} "
@@ -1264,7 +1489,8 @@ if fx_results:
                 st.warning(f"**Nur Steuerjahr geladen.** FIFO-Approximation.{extra} "
                            "Für exakte Werte: IBKR Standard-Bericht (CSV) oben hochladen.")
         st.info("**Rechtsgrundlage:** BMF-Schreiben Rn. 131 - verzinsliches Fremdwährungsguthaben, "
-                "§20 Abs. 2 S. 1 Nr. 7 EStG (Anlage KAP, Topf 2). FIFO-Methode (§20 Abs. 4 S. 7). "
+                "§20 Abs. 2 S. 1 Nr. 7 i.V.m. Abs. 4 S. 1 EStG (Anlage KAP, Topf 2). "
+                "FIFO-Methode (§20 Abs. 4 S. 7). "
                 "In Topf 2 enthalten.")
 
 # ── Anlage KAP-INV · Investmentfonds (Detail-Anzeige) ─────────────────────────
@@ -1290,7 +1516,7 @@ if has_etf_data and invstg_aktiv:
     if etf_unknown:
         st.markdown(f"""
 <div style="background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
-    <strong style="color: #fbbf24;">Unbekannte ETFs — manuelle Klassifizierung:</strong> {len(etf_unknown)} ETF(s) nicht in der Klassifizierungstabelle.
+    <strong style="color: #fbbf24;">Unbekannte ETFs, manuelle Klassifizierung:</strong> {len(etf_unknown)} ETF(s) nicht in der Klassifizierungstabelle.
     Standardmässig als sonstiger Fonds (0% TFS) behandelt. Falls es sich um Aktienfonds handelt (mind. 51% Aktienquote), bitte unten korrigieren.
 </div>
 """, unsafe_allow_html=True)
@@ -1299,7 +1525,7 @@ if has_etf_data and invstg_aktiv:
             info = etf_by_isin.get(isin, {})
             ticker = info.get('ticker', isin[:12])
             name = info.get('name', '')
-            label = f"{ticker} ({isin})" + (f" — {name}" if name else "")
+            label = f"{ticker} ({isin})" + (f": {name}" if name else "")
             choice = st.selectbox(label, list(cls_options.keys()), key=f"etf_cls_{isin}")
             new_tfs = cls_options[choice]
             old_tfs = info.get('tfs_rate', 0.0)
@@ -1953,38 +2179,77 @@ if csv_cats:
     if 'withholding_tax_eur' in csv_income:
         rows.append(("Quellensteuer", abs(csv_income['withholding_tax_eur']), our_wht))
 
+    # FX-Saldo-Korrektur-Diff (für Erkennung der erwarteten FX-Devisen-Abweichung)
+    _fx_meta_chk = d.get('fx_option_a_meta', {}) or {}
+    _fx_corr_active_chk = d.get('fx_margin_correction_enabled', True)
+    _fx_margin_diff_chk = _fx_meta_chk.get('corrected_total', 0.0) - _fx_meta_chk.get('raw_total', 0.0)
+    _fx_margin_explains_diff = _fx_corr_active_chk and abs(_fx_margin_diff_chk) > 0.01
+
     check_table = "| Kategorie | IBKR-Bericht | Unsere Berechnung | Differenz |\n|-----------|-------------|-------------------|----------|\n"
     all_match = True
     zinsen_fx_diff = False
+    fx_saldo_diff = False
     for label, ibkr_val, our_val in rows:
         diff = our_val - ibkr_val
         match = abs(diff) < 1.0
+        # FX (Devisen)-Differenz durch Saldo-Korrektur ist eine bekannte steuerliche
+        # Anpassung, kein Verarbeitungsfehler — wie Zinsen-FX-Diff behandeln.
+        is_fx_saldo = (label == "FX (Devisen) Netto"
+                       and _fx_margin_explains_diff
+                       and abs(diff - _fx_margin_diff_chk) < 1.0)
         if not match:
             if label == "Zinsen":
                 zinsen_fx_diff = True
+            elif is_fx_saldo:
+                fx_saldo_diff = True
             else:
                 all_match = False
-        icon = "" if match else (" **(FX)**" if label == "Zinsen" else " **(!)**")
+        if match:
+            icon = ""
+        elif label == "Zinsen":
+            icon = " **(FX)**"
+        elif is_fx_saldo:
+            icon = " **(FX-Saldo)**"
+        else:
+            icon = " **(!)**"
         check_table += f"| {label} | {fmt_de(ibkr_val)} | {fmt_de(our_val)} | {fmt_de(diff)}{icon} |\n"
     st.markdown(check_table)
-    if all_match and not zinsen_fx_diff:
+    if all_match and not zinsen_fx_diff and not fx_saldo_diff:
         st.success("Alle Kategorien stimmen mit dem IBKR-Bericht überein.")
-    elif all_match and zinsen_fx_diff:
-        st.success("Alle Kategorien stimmen überein. Zinsen-Differenz ist eine bekannte FX-Konvertierungsdifferenz "
-                   "(IBKR konvertiert Fremdwährungs-Anleiheposten im CSV-Bericht mit anderen Kursen als in der XML-BaseCurrency-Ansicht).")
+    elif all_match and (zinsen_fx_diff or fx_saldo_diff):
+        explanations = []
+        if zinsen_fx_diff:
+            explanations.append("Zinsen-Differenz ist eine bekannte FX-Konvertierungsdifferenz "
+                                "(IBKR konvertiert Fremdwährungs-Anleiheposten im CSV-Bericht mit "
+                                "anderen Kursen als in der XML-BaseCurrency-Ansicht)")
+        if fx_saldo_diff:
+            explanations.append("FX-Differenz ist die aktivierte Saldo-Korrektur "
+                                "(§20 Abs. 2 S. 1 Nr. 7 EStG, BMF Rn. 131; IBKR kennt keine "
+                                "Margin-Schuld-Unterscheidung)")
+        st.success("Alle Kategorien stimmen überein. " + "; ".join(explanations) + ".")
     else:
         st.info("Kleine Abweichungen sind normal (FX-Rundung, Steuerkorrekturen aus Vorjahren).")
     if has_etf_data and invstg_aktiv:
         st.caption("InvStG aktiv: ETF-Werte wurden für diesen Vergleich zurückaddiert, da der IBKR-Bericht keine InvStG-Trennung kennt.")
     if has_so_data:
         st.caption("Anlage SO aktiv: Gold-ETC-Werte wurden für diesen Vergleich zurückaddiert, da IBKR sie als Aktien zählt.")
-    if tageskurs_aktiv or zufluss_adj != 0:
+    # FX-Saldo-Korrektur als zusätzlicher Korrektur-Posten gegen IBKR-Rohwerte
+    _fx_meta_pl = d.get('fx_option_a_meta', {}) or {}
+    _fx_corr_active_pl = d.get('fx_margin_correction_enabled', True)
+    _fx_corrected_total_pl = _fx_meta_pl.get('corrected_total', 0.0)
+    _fx_raw_total_pl = _fx_meta_pl.get('raw_total', 0.0)
+    _fx_margin_diff = _fx_corrected_total_pl - _fx_raw_total_pl
+    _fx_margin_relevant = _fx_corr_active_pl and abs(_fx_margin_diff) > 0.01
+
+    if tageskurs_aktiv or zufluss_adj != 0 or _fx_margin_relevant:
         notes = []
         if tageskurs_aktiv:
             corr_sign = "+" if fx_corr_total >= 0 else ""
             notes.append(f"Tageskurs-Korrektur ({corr_sign}{fmt_de(fx_corr_total)} EUR)")
         if zufluss_adj != 0:
             notes.append(f"Stillhalter-Zufluss ({'+' if zufluss_adj >= 0 else ''}{fmt_de(zufluss_adj)} EUR)")
+        if _fx_margin_relevant:
+            notes.append(f"FX-Saldo-Korrektur ({'+' if _fx_margin_diff >= 0 else ''}{fmt_de(_fx_margin_diff)} EUR)")
         excluded = " und ".join(notes)
         st.caption(
             f"Der Plausibilitätscheck vergleicht unsere Berechnung 1:1 gegen IBKR's eigene Summen. "
@@ -2089,7 +2354,7 @@ if zuflussprinzip_aktiv and cross_year_details:
         year_table += f"| {year} | {fmt_de(cross_year_by_year[year])} | In Steuererklärung {year} eintragen |\n"
     st.markdown(year_table)
 
-    st.info(f"**Gesamtbetrag Vorjahres-Prämien:** {fmt_de(cross_year_premium)} EUR — "
+    st.info(f"**Gesamtbetrag Vorjahres-Prämien:** {fmt_de(cross_year_premium)} EUR. "
             f"um diesen Betrag wurde Zeile 19 im aktuellen Jahr reduziert.")
 
 # ── Stillhalter-Zufluss Details (offene Positionen + Vorjahres-Korrekturen) ──
@@ -2442,6 +2707,25 @@ if fx_results:
     fx_export += f"  FX Gesamt Verlust:     {fmt_de(fx_total_loss):>14} EUR\n"
     fx_export += f"  FX Netto:              {fmt_de(fx_net):>14} EUR\n"
     fx_export += "  (In Topf 2 enthalten, BMF Rn. 131)\n"
+    # Toggle-Stand dokumentieren, damit der Bericht auch ohne GUI nachvollziehbar bleibt
+    _fx_corr_active = d.get('fx_margin_correction_enabled', True)
+    _fx_neg = d.get('fx_has_negative_balance', False)
+    _fx_meta = d.get('fx_option_a_meta', {}) or {}
+    if _fx_corr_active:
+        fx_export += "  Saldo-Korrektur (§20 Abs. 2 S. 1 Nr. 7 EStG): AKTIV (konservativ)\n"
+        _skipped = _fx_meta.get('skipped_full', 0)
+        _partial = _fx_meta.get('partial_count', 0)
+        _approx = _fx_meta.get('approx_matches', 0)
+        if _skipped or _partial or _approx:
+            fx_export += (
+                f"    → {_skipped} Abflüsse komplett aus Margin-Schuld (kein PnL), "
+                f"{_partial} proportional gekürzt, {_approx} approximative Matches "
+                f"(IBKR-Rohwert belassen).\n"
+            )
+    else:
+        fx_export += "  Saldo-Korrektur (§20 Abs. 2 S. 1 Nr. 7 EStG): DEAKTIVIERT (Opt-out)\n"
+        if _fx_neg:
+            fx_export += "    → IBKR-/Rohwerte übernommen trotz negativem Fremdwährungssaldo.\n"
 
 sh_export = ""
 if sh_count > 0:
@@ -2537,7 +2821,7 @@ ANLAGE KAP EINTRAGUNGEN
   Zeile 22 (Verluste o. Aktien): {fmt_de(final['zeile_22']):>8} EUR
   Zeile 23 (Aktienverluste): {fmt_de(final['zeile_23']):>11} EUR
   Zeile 41 (ausl. Quellensteuer): {fmt_de(final['quellensteuer']):>8} EUR
-{de_kest_export}{"" if not (has_etf_data and invstg_aktiv) else chr(10) + "ANLAGE KAP-INV EINTRAGUNGEN" + chr(10) + f"  KAP-INV Erträge (nach TFS): {fmt_de(final['etf_net_taxable']):>8} EUR" + chr(10) + f"  KAP-INV QSt anrechenbar: {fmt_de(final['etf_wht']):>10} EUR" + chr(10)}{"" if not has_so_data else chr(10) + "ANLAGE SO (§23 EStG) — PRIVATE VERÄUSSERUNGSGESCHÄFTE" + chr(10) + f"  Physische Gold-ETCs (BFH VIII R 4/15)" + chr(10) + f"  Steuerpflichtig (≤ 1J): {fmt_de(so_taxable_for_row):>12} EUR  → Anlage SO" + chr(10) + f"  Steuerfrei (> 1J):      {fmt_de(so_free_for_row):>12} EUR" + chr(10)}═══════════════════════════════════════════════════
+{de_kest_export}{"" if not (has_etf_data and invstg_aktiv) else chr(10) + "ANLAGE KAP-INV EINTRAGUNGEN" + chr(10) + f"  KAP-INV Erträge (nach TFS): {fmt_de(final['etf_net_taxable']):>8} EUR" + chr(10) + f"  KAP-INV QSt anrechenbar: {fmt_de(final['etf_wht']):>10} EUR" + chr(10)}{"" if not has_so_data else chr(10) + "ANLAGE SO (§23 EStG): PRIVATE VERÄUSSERUNGSGESCHÄFTE" + chr(10) + f"  Physische Gold-ETCs (BFH VIII R 4/15)" + chr(10) + f"  Steuerpflichtig (≤ 1J): {fmt_de(so_taxable_for_row):>12} EUR  → Anlage SO" + chr(10) + f"  Steuerfrei (> 1J):      {fmt_de(so_free_for_row):>12} EUR" + chr(10)}═══════════════════════════════════════════════════
 """
 
 st.download_button(

@@ -1921,7 +1921,11 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             close_qty = abs(int(safe_float(ev.get('quantity'))))
             if close_qty <= 0:
                 continue
-            is_buy_close = (ev.get('transactionType') == 'ExchTrade' and ev.get('buySell') == 'BUY'
+            # Steuerwirksame Schließung = jeder BUY mit realisierter PnL: ExchTrade-Buyback
+            # ODER BookTrade-Verfall (fifoPnlRealized = Prämie). BookTrade mit PnL≈0
+            # (Assignment) bleibt ausgenommen — dessen Cross-Year-Prämie erfasst
+            # _build_stillhalter_details_for_assignment separat (sonst Doppelkorrektur).
+            is_buy_close = (ev.get('buySell') == 'BUY'
                             and abs(safe_float(ev.get('fifoPnlRealized'))) >= 0.01)
             remaining_close = close_qty
             for lot in open_lots:
@@ -2059,10 +2063,15 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     for t in trades:
         if t.get('assetCategory') not in ('OPT', 'FOP', 'FSFOP'):
             continue
-        if t.get('buySell') != 'BUY' or t.get('transactionType') != 'ExchTrade':
+        # Gleiche Close-Definition wie is_buy_close im Zufluss-FIFO: jeder BUY
+        # mit realisierter PnL — ExchTrade-Buyback ODER BookTrade-Verfall
+        # (fifoPnlRealized = Prämie). Assignments (PnL≈0) fallen durch den
+        # PnL-Filter. Vorher wurden BookTrade-Verfälle ohne Vorjahres-XML
+        # nicht gewarnt, obwohl die Prämie doppelt versteuert bleibt.
+        if t.get('buySell') != 'BUY':
             continue
         if abs(safe_float(t.get('fifoPnlRealized'))) < 0.01:
-            continue  # Opening BUY, not a close
+            continue  # Opening BUY oder Assignment, not a taxable close
         rd = parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))
         if not rd or rd.year != tax_year:
             continue

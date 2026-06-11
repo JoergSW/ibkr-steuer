@@ -105,6 +105,33 @@ def make_buy_close(date, qty, price, pnl, strike="100", expiry="2024-12-20",
     }
 
 
+def make_expiry(date, qty, pnl, strike="100", expiry="2024-12-20", pc="P",
+                underlying="TEST", a_cat="OPT", multiplier="100"):
+    """Wertloser Verfall eines Shorts: BookTrade BUY mit fifoPnlRealized = Praemie."""
+    return {
+        "tradeID": f"expire_{underlying}_{date}_{qty}",
+        "assetCategory": a_cat,
+        "transactionType": "BookTrade",
+        "buySell": "BUY",
+        "putCall": pc,
+        "strike": strike,
+        "expiry": expiry,
+        "underlyingSymbol": underlying,
+        "symbol": f"{underlying} {strike} {expiry} {pc}",
+        "quantity": str(qty),
+        "tradePrice": "0",
+        "closePrice": "0",
+        "multiplier": multiplier,
+        "ibCommission": "0",
+        "fxRateToBase": "1.0",
+        "dateTime": f"{date} 16:20:00",
+        "tradeDate": date,
+        "reportDate": date,
+        "fifoPnlRealized": str(pnl),
+        "notes": "Ep",
+    }
+
+
 def calculate_for_trades(trades, tax_year=2022, closed_lots=None, conversion_rates=None):
     fieldnames = sorted({k for row in trades for k in row})
     with tempfile.TemporaryDirectory() as tmp:
@@ -1035,6 +1062,60 @@ def test_cross_year_put_correction_handles_spaced_underlying_symbol():
     print(f"    cost {stock_rows[0]['cost']:.2f}, cross_year_put_total {audit['cross_year_put_total']:.2f}")
 
 
+def test_cross_year_worthless_expiry_gets_prior_zufluss_correction():
+    """TC18: Wertloser Verfall eines Vorjahres-Shorts darf nicht doppelt versteuert werden.
+
+    SELL 2024 (Zufluss 2024 versteuert), wertloser Verfall 2025 (BookTrade BUY,
+    fifoPnlRealized = Praemie). Ohne Korrektur wuerde die Praemie 2025 erneut
+    voll in options_gain laufen (Audit-Finding F2/H1, Beleg TLT 94.5P).
+    """
+    trades = [
+        make_sell("2024-12-15", 1, 5.00, strike="100", expiry="2025-01-17",
+                  underlying="EXPF"),
+        make_expiry("2025-01-17", 1, 499.0, strike="100", expiry="2025-01-17",
+                    underlying="EXPF"),
+    ]
+    rd = calculate_for_trades(trades, tax_year=2025)
+    audit = rd.get("audit", {})
+
+    assert_close(audit.get("prior_zufluss_correction_eur", 0), 499.0,
+                 label="TC18 prior_zufluss_correction_eur")
+    assert_close(audit.get("zufluss_premium_eur", 0), 0.0,
+                 label="TC18 zufluss_premium_eur")
+    # Netto-Steuerwirkung 2025: Verfalls-PnL (+499) minus Korrektur (-499) = 0
+    assert_close(rd.get("options_gain_eur", 0), 0.0,
+                 label="TC18 options_gain_eur netto")
+
+    print("  TC18 Cross-Year-Verfall erzeugt Vorjahreskorrektur: OK")
+    print("    Verfalls-PnL 499.00 EUR durch prior_zufluss -499.00 EUR neutralisiert")
+
+
+def test_same_year_worthless_expiry_no_correction():
+    """TC19: Same-Year-Verfall (SELL und Verfall im Steuerjahr) braucht KEINE Korrektur.
+
+    Die Praemie wird genau einmal als Verfalls-PnL versteuert; weder Zufluss-
+    Detail (Lot ist konsumiert) noch prior_zufluss (Sell-Jahr == Steuerjahr).
+    """
+    trades = [
+        make_sell("2025-06-16", 1, 5.00, strike="100", expiry="2025-07-18",
+                  underlying="EXPS"),
+        make_expiry("2025-07-18", 1, 499.0, strike="100", expiry="2025-07-18",
+                    underlying="EXPS"),
+    ]
+    rd = calculate_for_trades(trades, tax_year=2025)
+    audit = rd.get("audit", {})
+
+    assert_close(audit.get("prior_zufluss_correction_eur", 0), 0.0,
+                 label="TC19 prior_zufluss_correction_eur")
+    assert_close(audit.get("zufluss_premium_eur", 0), 0.0,
+                 label="TC19 zufluss_premium_eur")
+    assert_close(rd.get("options_gain_eur", 0), 499.0,
+                 label="TC19 options_gain_eur")
+
+    print("  TC19 Same-Year-Verfall ohne Doppel-Korrektur: OK")
+    print("    Praemie genau einmal als Verfalls-PnL 499.00 EUR versteuert")
+
+
 if __name__ == "__main__":
     test_cross_year_put_series()
     test_cross_year_call_series()
@@ -1053,4 +1134,6 @@ if __name__ == "__main__":
     test_cross_year_put_topf1_consistent_across_fx_rates()
     test_cross_year_put_correction_only_hits_sell_rows()
     test_cross_year_put_correction_handles_spaced_underlying_symbol()
-    print("\nOK: alle 17 TCs gruen")
+    test_cross_year_worthless_expiry_gets_prior_zufluss_correction()
+    test_same_year_worthless_expiry_no_correction()
+    print("\nOK: alle 19 TCs gruen")

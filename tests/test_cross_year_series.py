@@ -1116,6 +1116,677 @@ def test_same_year_worthless_expiry_no_correction():
     print("    Praemie genau einmal als Verfalls-PnL 499.00 EUR versteuert")
 
 
+def _stock_sell_row(trade_id, symbol, date, qty, pnl, cost, proceeds,
+                    transaction_type="ExchTrade"):
+    return {
+        "tradeID": trade_id,
+        "assetCategory": "STK",
+        "transactionType": transaction_type,
+        "buySell": "SELL",
+        "openCloseIndicator": "C",
+        "underlyingSymbol": symbol,
+        "symbol": symbol,
+        "description": f"{symbol} CORP",
+        "quantity": str(-qty),
+        "tradePrice": str(proceeds / qty),
+        "closePrice": str(proceeds / qty),
+        "ibCommission": "0",
+        "fxRateToBase": "1.0",
+        "currency": "EUR",
+        "dateTime": f"{date} 16:20:00",
+        "tradeDate": date,
+        "reportDate": date,
+        "fifoPnlRealized": str(pnl),
+        "cost": str(cost),
+        "proceeds": str(proceeds),
+    }
+
+
+def test_call_assignment_correction_only_hits_assignment_day_sale():
+    """TC20: Call-Korrektur darf fruehere Verkaeufe desselben Underlyings nicht treffen.
+
+    Audit-Finding F1a: Call-Korrekturen ohne Datums-Gate (close_date='') matchten
+    jede STK-Row des Underlyings in Dateireihenfolge (SVOL-Fall: Mai-Andienung
+    korrigierte Februar/Mai-Verkaeufe und raeumte die Rows fuer spaetere Puts leer).
+    """
+    trades = [
+        # Unabhaengiger Verkauf im Maerz, steht in Dateireihenfolge VOR der Andienung
+        _stock_sell_row("whl_march_sale", "WHL", "2025-03-10", 100, 200.0, 5000.0, 5200.0),
+        make_sell("2025-06-01", 1, 3.00, strike="105", expiry="2025-07-18",
+                  pc="C", underlying="WHL"),
+        make_assignment("2025-07-18", 1, strike="105", expiry="2025-07-18",
+                        pc="C", underlying="WHL"),
+        # Andienungs-Verkauf: IBKR-PnL enthaelt die Call-Praemie (echt 500 + 299)
+        _stock_sell_row("whl_assignment_sale", "WHL", "2025-07-18", 100, 799.0,
+                        9701.0, 10500.0, transaction_type="BookTrade"),
+    ]
+    rd = calculate_for_trades(trades, tax_year=2025)
+
+    rows = {r["reportDate"]: r for r in rd["trade_details"]
+            if r.get("symbol") == "WHL" and r.get("source") == "trades"}
+    march = rows["2025-03-10"]
+    july = rows["2025-07-18"]
+
+    assert not march.get("stillhalter_adjusted"), \
+        "TC20: Maerz-Verkauf darf die Call-Korrektur NICHT erhalten"
+    assert_close(march["fifoPnlRealized"], 200.0, label="TC20 maerz pnl unveraendert")
+    assert july.get("stillhalter_adjusted"), \
+        "TC20: Andienungs-Verkauf muss die Call-Korrektur erhalten"
+    assert_close(july["fifoPnlRealized"], 500.0, label="TC20 juli pnl korrigiert")
+    assert_close(rd.get("stocks_gain_eur", 0), 700.0, label="TC20 stocks_gain")
+    assert rd["audit"].get("stillhalter_corrections_dropped", []) == [], \
+        "TC20: keine verworfenen Korrekturen erwartet"
+
+    print("  TC20 Call-Korrektur nur auf Andienungs-Tag-Verkauf: OK")
+    print("    Maerz-Row 200.00 unveraendert, Juli-Row 799.00 -> 500.00")
+
+
+def test_put_and_call_premium_stack_on_same_stock_row():
+    """TC21: Dieselben Shares tragen legitim Put- UND Call-Praemie (IWM-Fall, F1b).
+
+    Put-Andienung kauft die Aktie (Praemie in Kostenbasis eingebettet), Call-
+    Andienung verkauft sie (Praemie im Erloes). Beide Korrekturen muessen auf
+    dieselbe Verkaufszeile; das alte gemeinsame Quantity-Cap liess nur eine zu.
+    """
+    trades = [
+        make_sell("2025-06-02", 1, 2.00, strike="100", expiry="2025-06-20",
+                  pc="P", underlying="STKD"),
+        make_assignment("2025-06-20", 1, strike="100", expiry="2025-06-20",
+                        pc="P", underlying="STKD"),
+        {
+            "tradeID": "stkd_stock_assignment_buy",
+            "assetCategory": "STK", "transactionType": "BookTrade", "buySell": "BUY",
+            "openCloseIndicator": "O", "underlyingSymbol": "STKD", "symbol": "STKD",
+            "description": "STKD CORP", "quantity": "100",
+            "tradePrice": "100", "closePrice": "98", "ibCommission": "0",
+            "fxRateToBase": "1.0", "currency": "EUR",
+            "dateTime": "2025-06-20 16:20:00", "tradeDate": "2025-06-20",
+            "reportDate": "2025-06-20", "fifoPnlRealized": "0",
+            "cost": "9801", "proceeds": "-9801",
+        },
+        make_sell("2025-07-01", 1, 3.00, strike="105", expiry="2025-07-18",
+                  pc="C", underlying="STKD"),
+        make_assignment("2025-07-18", 1, strike="105", expiry="2025-07-18",
+                        pc="C", underlying="STKD"),
+        # IBKR-PnL = 10500 - 9801 (reduzierte Basis) + 299 (Call-Praemie) = 998
+        _stock_sell_row("stkd_assignment_sale", "STKD", "2025-07-18", 100, 998.0,
+                        9801.0, 10500.0, transaction_type="BookTrade"),
+    ]
+    closed_lots = [{
+        "assetCategory": "STK", "currency": "EUR",
+        "reportDate": "2025-07-18", "dateTime": "2025-07-18 16:20:00",
+        "openDateTime": "2025-06-20 16:20:00",
+        "quantity": "100", "cost": "9801", "fifoPnlRealized": "998",
+        "fxRateToBase": "1.0", "symbol": "STKD", "description": "STKD CORP",
+        "underlyingSymbol": "STKD",
+    }]
+    rd = calculate_for_trades(trades, tax_year=2025, closed_lots=closed_lots)
+
+    rows = [r for r in rd["trade_details"]
+            if r.get("symbol") == "STKD" and r.get("source") == "trades"
+            and r.get("buySell") == "SELL"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.get("stillhalter_adjusted"), "TC21: Verkaufszeile muss korrigiert sein"
+    # 998 - 199 (Put-Praemie netto) - 299 (Call-Praemie netto) = 500 echter Aktien-PnL
+    assert_close(row["fifoPnlRealized"], 500.0, label="TC21 pnl beide Praemien raus")
+    assert_close(rd.get("stocks_gain_eur", 0), 500.0, label="TC21 stocks_gain")
+    assert_close(rd.get("options_gain_eur", 0), 498.0, label="TC21 options_gain")
+    assert rd["audit"].get("stillhalter_corrections_dropped", []) == [], \
+        "TC21: keine verworfenen Korrekturen erwartet"
+
+    print("  TC21 Put+Call-Praemien-Stack auf derselben Verkaufszeile: OK")
+    print("    998.00 -> 500.00 (Put -199.00, Call -299.00)")
+
+
+def test_unapplied_correction_is_tracked_and_warned():
+    """TC22: Nicht zuordenbare Korrekturen duerfen nicht still verfallen (F1c).
+
+    Gibt es am Andienungstag keine passende Verkaufszeile, bleibt die Praemie im
+    Aktien-PnL eingebettet (Doppelversteuerung). Das muss im Audit-Feld
+    stillhalter_corrections_dropped sichtbar werden, statt still zu verschwinden.
+    """
+    trades = [
+        _stock_sell_row("orph_march_sale", "ORPH", "2025-03-10", 100, 200.0,
+                        5000.0, 5200.0),
+        make_sell("2025-06-01", 1, 3.00, strike="105", expiry="2025-07-18",
+                  pc="C", underlying="ORPH"),
+        make_assignment("2025-07-18", 1, strike="105", expiry="2025-07-18",
+                        pc="C", underlying="ORPH"),
+        # KEINE Stock-Verkaufszeile am Andienungstag (Datenanomalie)
+    ]
+    rd = calculate_for_trades(trades, tax_year=2025)
+
+    rows = [r for r in rd["trade_details"]
+            if r.get("symbol") == "ORPH" and r.get("source") == "trades"]
+    assert len(rows) == 1
+    assert not rows[0].get("stillhalter_adjusted"), \
+        "TC22: Maerz-Verkauf darf nicht korrigiert werden"
+    assert_close(rows[0]["fifoPnlRealized"], 200.0, label="TC22 maerz pnl")
+
+    dropped = rd["audit"].get("stillhalter_corrections_dropped", [])
+    assert len(dropped) == 1, f"TC22: erwartet 1 dropped-Eintrag, aktuell {dropped}"
+    assert dropped[0]["underlying"] == "ORPH"
+    assert_close(dropped[0]["leftover_raw"], 299.0, label="TC22 leftover_raw")
+    assert dropped[0]["leftover_shares"] == 100
+
+    print("  TC22 Verworfene Korrektur wird getrackt und gewarnt: OK")
+    print(f"    ORPH: 299.00 auf 100 Stueck ohne passende Verkaufszeile")
+
+
+def test_call_assignment_short_cover_correction_on_buy_row():
+    """TC23: Call-Andienung ohne Bestand: Praemie sitzt im spaeteren Short-Cover.
+
+    Audit-Realfall SPY/BITO/MPW: Die Andienung eroeffnet einen Aktien-Short
+    (SELL, PnL=0, oc=O); IBKR realisiert den PnL inkl. Praemie erst beim
+    Rueckkauf. Die Korrektur muss auf die BUY-Row des Cover-Tags (per
+    Short-Lot-Match openDateTime == Andienungstag), nicht auf den Andienungstag.
+    """
+    trades = [
+        make_sell("2025-06-01", 1, 3.00, strike="105", expiry="2025-07-18",
+                  pc="C", underlying="SHRT"),
+        make_assignment("2025-07-18", 1, strike="105", expiry="2025-07-18",
+                        pc="C", underlying="SHRT"),
+        # Andienung eroeffnet Short: SELL mit PnL=0
+        {
+            "tradeID": "shrt_assignment_short_open",
+            "assetCategory": "STK", "transactionType": "BookTrade", "buySell": "SELL",
+            "openCloseIndicator": "O", "underlyingSymbol": "SHRT", "symbol": "SHRT",
+            "description": "SHRT CORP", "quantity": "-100",
+            "tradePrice": "105", "closePrice": "105", "ibCommission": "0",
+            "fxRateToBase": "1.0", "currency": "EUR",
+            "dateTime": "2025-07-18 16:20:00", "tradeDate": "2025-07-18",
+            "reportDate": "2025-07-18", "fifoPnlRealized": "0",
+            "cost": "-10799", "proceeds": "10500",
+        },
+        # Cover: BUY realisiert IBKR-PnL = 200 echt + 299 Praemie = 499
+        {
+            "tradeID": "shrt_cover_buy",
+            "assetCategory": "STK", "transactionType": "ExchTrade", "buySell": "BUY",
+            "openCloseIndicator": "C", "underlyingSymbol": "SHRT", "symbol": "SHRT",
+            "description": "SHRT CORP", "quantity": "100",
+            "tradePrice": "103", "closePrice": "103", "ibCommission": "0",
+            "fxRateToBase": "1.0", "currency": "EUR",
+            "dateTime": "2025-08-05 10:00:00", "tradeDate": "2025-08-05",
+            "reportDate": "2025-08-05", "fifoPnlRealized": "499",
+            "cost": "-10799", "proceeds": "-10300",
+        },
+    ]
+    closed_lots = [{
+        "assetCategory": "STK", "currency": "EUR",
+        "reportDate": "2025-08-05", "dateTime": "2025-08-05 10:00:00",
+        "openDateTime": "2025-07-18 16:20:00",
+        "quantity": "-100", "buySell": "BUY",
+        "cost": "-10799", "fifoPnlRealized": "499",
+        "fxRateToBase": "1.0", "symbol": "SHRT", "description": "SHRT CORP",
+        "underlyingSymbol": "SHRT",
+    }]
+    rd = calculate_for_trades(trades, tax_year=2025, closed_lots=closed_lots)
+
+    stk_rows = [r for r in rd["trade_details"]
+                if r.get("symbol") == "SHRT" and r.get("source") == "trades"]
+    # Die Short-Eroeffnung (PnL=0) erzeugt keine trade_details-Row; es darf
+    # ausschliesslich der Cover-BUY korrigiert worden sein.
+    adjusted = [r for r in stk_rows if r.get("stillhalter_adjusted")]
+    assert len(adjusted) == 1, f"TC23: genau 1 korrigierte Row erwartet, aktuell {len(adjusted)}"
+    cover = adjusted[0]
+    assert (cover["reportDate"], cover["buySell"]) == ("2025-08-05", "BUY"), \
+        f"TC23: Korrektur muss auf dem Cover-BUY sitzen, aktuell {cover['reportDate']}/{cover['buySell']}"
+    assert_close(cover["fifoPnlRealized"], 200.0, label="TC23 cover pnl korrigiert")
+    assert_close(rd.get("stocks_gain_eur", 0), 200.0, label="TC23 stocks_gain")
+    assert_close(rd.get("options_gain_eur", 0), 299.0, label="TC23 options_gain")
+    assert rd["audit"].get("stillhalter_corrections_dropped", []) == [], \
+        "TC23: keine verworfenen Korrekturen erwartet"
+
+    print("  TC23 Call-Short-Cover-Korrektur auf BUY-Row des Cover-Tags: OK")
+    print("    Cover 499.00 -> 200.00, Short-Eroeffnung unveraendert")
+
+
+def test_two_same_day_call_assignments_use_separate_cover_lots():
+    """TC24: Zwei Same-Day-Call-Andienungen duerfen nicht denselben Cover-Lot claimen.
+
+    Codex-Review-Finding (P2): _call_assignment_short_lot_matches scannte pro
+    Detail von vorne; bei zwei Andienungen desselben Underlyings am selben Tag
+    matchen beide den ersten Cover-Lot, die zweite Korrektur verfaellt als
+    dropped und die zweite Cover-Row behaelt die eingebettete Praemie.
+    """
+    a1 = make_assignment("2025-07-18", 1, strike="105", expiry="2025-07-18",
+                         pc="C", underlying="DUP")
+    a2 = make_assignment("2025-07-18", 1, strike="110", expiry="2025-07-18",
+                         pc="C", underlying="DUP")
+    a1["tradeID"] = "assign_dup_c105"
+    a2["tradeID"] = "assign_dup_c110"
+
+    trades = [
+        make_sell("2025-06-01", 1, 3.00, strike="105", expiry="2025-07-18",
+                  pc="C", underlying="DUP"),
+        make_sell("2025-06-02", 1, 2.00, strike="110", expiry="2025-07-18",
+                  pc="C", underlying="DUP"),
+        a1, a2,
+        _call_stk_row("DUP", "dup_short_open_1", "SELL", "O", -100, "2025-07-18", 0,
+                      tt="BookTrade"),
+        _call_stk_row("DUP", "dup_short_open_2", "SELL", "O", -100, "2025-07-18", 0,
+                      tt="BookTrade"),
+        _call_stk_row("DUP", "dup_cover_1", "BUY", "C", 100, "2025-08-05", 499),  # 200 echt + 299
+        _call_stk_row("DUP", "dup_cover_2", "BUY", "C", 100, "2025-09-10", 299),  # 100 echt + 199
+    ]
+    closed_lots = [
+        {"assetCategory": "STK", "currency": "EUR", "reportDate": "2025-08-05",
+         "dateTime": "2025-08-05 10:00:00", "openDateTime": "2025-07-18 16:20:00",
+         "quantity": "-100", "buySell": "BUY", "cost": "-10500",
+         "fifoPnlRealized": "499", "fxRateToBase": "1.0",
+         "symbol": "DUP", "underlyingSymbol": "DUP"},
+        {"assetCategory": "STK", "currency": "EUR", "reportDate": "2025-09-10",
+         "dateTime": "2025-09-10 10:00:00", "openDateTime": "2025-07-18 16:20:00",
+         "quantity": "-100", "buySell": "BUY", "cost": "-11000",
+         "fifoPnlRealized": "299", "fxRateToBase": "1.0",
+         "symbol": "DUP", "underlyingSymbol": "DUP"},
+    ]
+    rd = calculate_for_trades(trades, tax_year=2025, closed_lots=closed_lots)
+
+    rows = {r["reportDate"]: r for r in rd["trade_details"]
+            if r.get("symbol") == "DUP" and r.get("source") == "trades"
+            and r.get("buySell") == "BUY"}
+    assert rows["2025-08-05"].get("stillhalter_adjusted"), "TC24: Cover 1 muss korrigiert sein"
+    assert rows["2025-09-10"].get("stillhalter_adjusted"), "TC24: Cover 2 muss korrigiert sein"
+    assert_close(rows["2025-08-05"]["fifoPnlRealized"], 200.0, label="TC24 cover1 pnl")
+    assert_close(rows["2025-09-10"]["fifoPnlRealized"], 100.0, label="TC24 cover2 pnl")
+    assert_close(rd.get("stocks_gain_eur", 0), 300.0, label="TC24 stocks_gain")
+    assert rd["audit"].get("stillhalter_corrections_dropped", []) == [], \
+        "TC24: keine verworfenen Korrekturen erwartet"
+
+    print("  TC24 Zwei Same-Day-Call-Andienungen nutzen separate Cover-Lots: OK")
+    print("    Cover1 499 -> 200, Cover2 299 -> 100, dropped leer")
+
+
+def test_two_same_day_put_assignments_use_separate_lots():
+    """TC25: Zwei Same-Day-Put-Teilandienungen duerfen nicht denselben Lot claimen.
+
+    Audit-Finding F3 (Put-Variante des Codex-Findings): _put_assignment_
+    closed_lot_matches konsumierte pro Detail ab Listenanfang neu; beide
+    Details claimten denselben Lot-Slice, die zweite Korrektur verfiel und der
+    spaetere Verkauf behielt die eingebettete Praemie.
+    """
+    s1 = make_sell("2025-06-02", 1, 2.00, strike="100", expiry="2025-06-20",
+                   pc="P", underlying="PRT")
+    s2 = make_sell("2025-06-03", 1, 2.00, strike="100", expiry="2025-06-20",
+                   pc="P", underlying="PRT")
+    a1 = make_assignment("2025-06-20", 1, strike="100", expiry="2025-06-20",
+                         pc="P", underlying="PRT")
+    a2 = make_assignment("2025-06-20", 1, strike="100", expiry="2025-06-20",
+                         pc="P", underlying="PRT")
+    a1["tradeID"] = "assign_prt_1"
+    a2["tradeID"] = "assign_prt_2"
+
+    trades = [
+        s1, s2, a1, a2,
+        _call_stk_row("PRT", "prt_buy_1", "BUY", "O", 100, "2025-06-20", 0,
+                      tt="BookTrade", cost=9801),
+        _call_stk_row("PRT", "prt_buy_2", "BUY", "O", 100, "2025-06-20", 0,
+                      tt="BookTrade", cost=9801),
+        # IBKR-PnL enthaelt je die eingebettete Praemie (199):
+        _call_stk_row("PRT", "prt_sale_1", "SELL", "C", -100, "2025-07-10", 199.0,
+                      cost=9801),   # echt 0
+        _call_stk_row("PRT", "prt_sale_2", "SELL", "C", -100, "2025-08-15", 399.0,
+                      cost=9801),   # echt 200
+    ]
+    closed_lots = [
+        {"assetCategory": "STK", "currency": "EUR", "reportDate": "2025-07-10",
+         "dateTime": "2025-07-10 10:00:00", "openDateTime": "2025-06-20 16:20:00",
+         "quantity": "100", "buySell": "SELL", "cost": "9801",
+         "fifoPnlRealized": "199", "fxRateToBase": "1.0",
+         "symbol": "PRT", "underlyingSymbol": "PRT"},
+        {"assetCategory": "STK", "currency": "EUR", "reportDate": "2025-08-15",
+         "dateTime": "2025-08-15 10:00:00", "openDateTime": "2025-06-20 16:20:00",
+         "quantity": "100", "buySell": "SELL", "cost": "9801",
+         "fifoPnlRealized": "399", "fxRateToBase": "1.0",
+         "symbol": "PRT", "underlyingSymbol": "PRT"},
+    ]
+    rd = calculate_for_trades(trades, tax_year=2025, closed_lots=closed_lots)
+
+    rows = {r["reportDate"]: r for r in rd["trade_details"]
+            if r.get("symbol") == "PRT" and r.get("source") == "trades"
+            and r.get("buySell") == "SELL"}
+    assert rows["2025-07-10"].get("stillhalter_adjusted"), "TC25: Verkauf 1 muss korrigiert sein"
+    assert rows["2025-08-15"].get("stillhalter_adjusted"), "TC25: Verkauf 2 muss korrigiert sein"
+    assert_close(rows["2025-07-10"]["fifoPnlRealized"], 0.0, label="TC25 sale1 pnl")
+    assert_close(rows["2025-08-15"]["fifoPnlRealized"], 200.0, label="TC25 sale2 pnl")
+    assert_close(rd.get("stocks_gain_eur", 0), 200.0, label="TC25 stocks_gain")
+    assert rd["audit"].get("stillhalter_corrections_dropped", []) == [], \
+        "TC25: keine verworfenen Korrekturen erwartet"
+
+    print("  TC25 Zwei Same-Day-Put-Andienungen nutzen separate Lots: OK")
+    print("    Sale1 199 -> 0, Sale2 399 -> 200, dropped leer")
+
+
+def test_call_short_cover_without_closed_lots_falls_back_to_trades():
+    """TC26: Short-Cover-Call MUSS auch ohne closed_lots.csv korrigiert werden.
+
+    Codex-Review-Finding 2 (P2, Regression): Ohne CLOSED_LOT-Daten ist der
+    Lot-Match leer und der SELL-Fallback greift ins Leere (Short-Eroeffnung hat
+    PnL=0 und erzeugt keine debug_row) — die Praemie blieb doppelt versteuert.
+    Fallback-Stufe 3: Cover-Kandidaten direkt aus trades.csv (BUY mit PnL!=0
+    nach dem Andienungstag, chronologisch).
+    """
+    trades = [
+        make_sell("2025-06-01", 1, 3.00, strike="105", expiry="2025-07-18",
+                  pc="C", underlying="NLOT"),
+        make_assignment("2025-07-18", 1, strike="105", expiry="2025-07-18",
+                        pc="C", underlying="NLOT"),
+        {
+            "tradeID": "nlot_short_open",
+            "assetCategory": "STK", "transactionType": "BookTrade", "buySell": "SELL",
+            "openCloseIndicator": "O", "underlyingSymbol": "NLOT", "symbol": "NLOT",
+            "description": "NLOT CORP", "quantity": "-100",
+            "tradePrice": "105", "closePrice": "105", "ibCommission": "0",
+            "fxRateToBase": "1.0", "currency": "EUR",
+            "dateTime": "2025-07-18 16:20:00", "tradeDate": "2025-07-18",
+            "reportDate": "2025-07-18", "fifoPnlRealized": "0",
+            "cost": "-10799", "proceeds": "10500",
+        },
+        {
+            "tradeID": "nlot_cover_buy",
+            "assetCategory": "STK", "transactionType": "ExchTrade", "buySell": "BUY",
+            "openCloseIndicator": "C", "underlyingSymbol": "NLOT", "symbol": "NLOT",
+            "description": "NLOT CORP", "quantity": "100",
+            "tradePrice": "103", "closePrice": "103", "ibCommission": "0",
+            "fxRateToBase": "1.0", "currency": "EUR",
+            "dateTime": "2025-08-05 10:00:00", "tradeDate": "2025-08-05",
+            "reportDate": "2025-08-05", "fifoPnlRealized": "499",
+            "cost": "-10799", "proceeds": "-10300",
+        },
+    ]
+    # BEWUSST keine closed_lots!
+    rd = calculate_for_trades(trades, tax_year=2025)
+
+    adjusted = [r for r in rd["trade_details"]
+                if r.get("symbol") == "NLOT" and r.get("source") == "trades"
+                and r.get("stillhalter_adjusted")]
+    assert len(adjusted) == 1, f"TC26: genau 1 korrigierte Row erwartet, aktuell {len(adjusted)}"
+    assert (adjusted[0]["reportDate"], adjusted[0]["buySell"]) == ("2025-08-05", "BUY"), \
+        f"TC26: Korrektur muss auf dem Cover-BUY sitzen, aktuell {adjusted[0]['reportDate']}/{adjusted[0]['buySell']}"
+    assert_close(adjusted[0]["fifoPnlRealized"], 200.0, label="TC26 cover pnl korrigiert")
+    assert_close(rd.get("stocks_gain_eur", 0), 200.0, label="TC26 stocks_gain")
+    assert_close(rd.get("options_gain_eur", 0), 299.0, label="TC26 options_gain")
+    assert rd["audit"].get("stillhalter_corrections_dropped", []) == [], \
+        "TC26: keine verworfenen Korrekturen erwartet"
+
+    print("  TC26 Short-Cover ohne CLOSED_LOT-Daten via trades-Fallback: OK")
+    print("    Cover 499 -> 200 ohne closed_lots.csv, dropped leer")
+
+
+def _call_stk_row(symbol, tid, bs, oc, qty, date, pnl, tt="ExchTrade", cost="0"):
+    return {"tradeID": tid, "assetCategory": "STK", "transactionType": tt,
+            "buySell": bs, "openCloseIndicator": oc, "underlyingSymbol": symbol,
+            "symbol": symbol, "description": f"{symbol} CORP", "quantity": str(qty),
+            "tradePrice": "100", "closePrice": "100", "ibCommission": "0",
+            "fxRateToBase": "1.0", "currency": "EUR",
+            "dateTime": f"{date} 16:20:00", "tradeDate": date, "reportDate": date,
+            "fifoPnlRealized": str(pnl), "cost": str(cost), "proceeds": "0"}
+
+
+def _call_cover_lot(symbol, open_date, close_date, qty, pnl):
+    return {"assetCategory": "STK", "currency": "EUR", "reportDate": close_date,
+            "dateTime": f"{close_date} 10:00:00",
+            "openDateTime": f"{open_date} 16:20:00",
+            "quantity": str(-qty), "buySell": "BUY", "cost": "-10500",
+            "fifoPnlRealized": str(pnl), "fxRateToBase": "1.0",
+            "symbol": symbol, "underlyingSymbol": symbol}
+
+
+def test_call_cover_with_partial_closed_lots():
+    """TC27: Unvollstaendige closed_lots duerfen den trades-Fallback nicht abschalten.
+
+    Codex-Review-Finding 3 (P2): Sobald EIN Lot matchte, war der trades-Fallback
+    fuer den uncovered-Rest deaktiviert — der zweite Cover blieb unkorrigiert.
+    Andienung 2 Kontrakte (200 Shares short), zwei Covers, nur Cover 1 in
+    closed_lots.csv.
+    """
+    trades = [
+        make_sell("2025-06-01", 2, 3.00, strike="105", expiry="2025-07-18",
+                  pc="C", underlying="PART"),
+        make_assignment("2025-07-18", 2, strike="105", expiry="2025-07-18",
+                        pc="C", underlying="PART"),
+        _call_stk_row("PART", "part_short_open", "SELL", "O", -200, "2025-07-18", 0,
+                      tt="BookTrade"),
+        # Prämie netto 599 -> 2.995/Share; Cover 1: 200 echt + 299.5
+        _call_stk_row("PART", "part_cover_1", "BUY", "C", 100, "2025-08-05", 499.5),
+        # Cover 2: 100 echt + 299.5 — Lot fehlt in closed_lots!
+        _call_stk_row("PART", "part_cover_2", "BUY", "C", 100, "2025-09-10", 399.5),
+    ]
+    closed_lots = [_call_cover_lot("PART", "2025-07-18", "2025-08-05", 100, 499.5)]
+    rd = calculate_for_trades(trades, tax_year=2025, closed_lots=closed_lots)
+
+    rows = {r["reportDate"]: r for r in rd["trade_details"]
+            if r.get("symbol") == "PART" and r.get("source") == "trades"
+            and r.get("buySell") == "BUY"}
+    assert rows["2025-08-05"].get("stillhalter_adjusted"), "TC27: Cover 1 (Lot) muss korrigiert sein"
+    assert rows["2025-09-10"].get("stillhalter_adjusted"), \
+        "TC27: Cover 2 (ohne Lot) muss via trades-Fallback korrigiert sein"
+    assert_close(rows["2025-08-05"]["fifoPnlRealized"], 200.0, label="TC27 cover1 pnl")
+    assert_close(rows["2025-09-10"]["fifoPnlRealized"], 100.0, label="TC27 cover2 pnl")
+    assert_close(rd.get("stocks_gain_eur", 0), 300.0, label="TC27 stocks_gain")
+    assert rd["audit"].get("stillhalter_corrections_dropped", []) == [], \
+        "TC27: keine verworfenen Korrekturen erwartet"
+
+    print("  TC27 Partielle closed_lots: Rest via trades-Fallback korrigiert: OK")
+    print("    Cover1 (Lot) 499.5 -> 200, Cover2 (trades) 399.5 -> 100")
+
+
+def test_call_assignment_mixed_long_and_short_without_lots():
+    """TC28: Gemischte Call-Andienung (Long-Close + Short-Open) ohne closed_lots.
+
+    Codex-Review-Finding 3, zweiter Trigger: has_assignment_day_sale (binaer)
+    schaltete den trades-Fallback ab, sobald IRGENDEIN Long-Verkauf am
+    Andienungstag existierte — der Short-Anteil blieb unkorrigiert.
+    """
+    trades = [
+        make_sell("2025-06-01", 2, 3.00, strike="105", expiry="2025-07-18",
+                  pc="C", underlying="MIXD"),
+        make_assignment("2025-07-18", 2, strike="105", expiry="2025-07-18",
+                        pc="C", underlying="MIXD"),
+        # 100 Shares aus Long-Bestand verkauft: PnL = 50 echt + 299.5 Praemie
+        _call_stk_row("MIXD", "mixd_long_sale", "SELL", "C", -100, "2025-07-18", 349.5,
+                      tt="BookTrade"),
+        # 100 Shares als Short eroeffnet (PnL=0)
+        _call_stk_row("MIXD", "mixd_short_open", "SELL", "O", -100, "2025-07-18", 0,
+                      tt="BookTrade"),
+        # Cover: PnL = 100 echt + 299.5 Praemie
+        _call_stk_row("MIXD", "mixd_cover", "BUY", "C", 100, "2025-09-10", 399.5),
+    ]
+    rd = calculate_for_trades(trades, tax_year=2025)  # KEINE closed_lots
+
+    rows = {(r["reportDate"], r["buySell"]): r for r in rd["trade_details"]
+            if r.get("symbol") == "MIXD" and r.get("source") == "trades"}
+    long_sale = rows[("2025-07-18", "SELL")]
+    cover = rows[("2025-09-10", "BUY")]
+    assert long_sale.get("stillhalter_adjusted"), "TC28: Long-Verkauf muss korrigiert sein"
+    assert cover.get("stillhalter_adjusted"), "TC28: Short-Cover muss korrigiert sein"
+    assert_close(long_sale["fifoPnlRealized"], 50.0, label="TC28 long sale pnl")
+    assert_close(cover["fifoPnlRealized"], 100.0, label="TC28 cover pnl")
+    assert_close(rd.get("stocks_gain_eur", 0), 150.0, label="TC28 stocks_gain")
+    assert rd["audit"].get("stillhalter_corrections_dropped", []) == [], \
+        "TC28: keine verworfenen Korrekturen erwartet"
+
+    print("  TC28 Mixed Long/Short-Call-Andienung ohne closed_lots: OK")
+    print("    Long-Sale 349.5 -> 50, Cover 399.5 -> 100")
+
+
+def test_call_assignment_open_short_is_not_an_error():
+    """TC29: Short aus Call-Andienung am Jahresende noch offen = KEIN Fehler.
+
+    Der Aktien-PnL ist unrealisiert; die Praemie gehoert nur in Topf 2. Bisher
+    landete der Fall faelschlich in stillhalter_corrections_dropped (Warnung
+    Doppelversteuerung) — korrekt ist: keine Korrektur, Info-Tracking in
+    stillhalter_open_short fuer den Folgejahr-Lauf.
+    """
+    trades = [
+        make_sell("2025-11-03", 1, 3.00, strike="105", expiry="2025-12-19",
+                  pc="C", underlying="OPSH"),
+        make_assignment("2025-12-19", 1, strike="105", expiry="2025-12-19",
+                        pc="C", underlying="OPSH"),
+        _call_stk_row("OPSH", "opsh_short_open", "SELL", "O", -100, "2025-12-19", 0,
+                      tt="BookTrade"),
+        # KEIN Cover bis Jahresende
+    ]
+    rd = calculate_for_trades(trades, tax_year=2025)
+
+    assert rd["audit"].get("stillhalter_corrections_dropped", []) == [], \
+        "TC29: offener Short darf NICHT als dropped/Doppelversteuerung gemeldet werden"
+    open_short = rd["audit"].get("stillhalter_open_short", [])
+    assert len(open_short) == 1, f"TC29: erwartet 1 open_short-Eintrag, aktuell {open_short}"
+    assert open_short[0]["underlying"] == "OPSH"
+    assert_close(open_short[0]["shares"], 100.0, label="TC29 open shares")
+    # Praemie korrekt in Topf 2, kein Aktien-PnL korrigiert
+    assert_close(rd.get("options_gain_eur", 0), 299.0, label="TC29 options_gain")
+    assert_close(rd.get("stocks_gain_eur", 0), 0.0, label="TC29 stocks_gain")
+
+    print("  TC29 Offener Short aus Call-Andienung ist kein Fehler: OK")
+    print("    Praemie 299 in Topf 2, open_short getrackt, dropped leer")
+
+
+def test_call_correction_targets_assignment_row_not_unrelated_same_day_trade():
+    """TC30: Fremde Same-Day-Row darf die Call-Korrektur nicht konsumieren.
+
+    Codex-Review Finding (4. Runde, P2): Das Datums-/Richtungs-Gate liess die
+    erste Row des Tages in debug_rows-Reihenfolge gewinnen. Die Korrektur muss
+    die Row-Identitaet tragen (Resolver kennt die konsumierte Row) und der
+    Resolver muss die BookTrade-Andienungsrow vor fremden ExchTrades waehlen.
+    Materieller Schaden ohne Fix: gain/loss-Split kippt (Fremd-Row ist Verlust).
+    """
+    trades = [
+        make_sell("2025-06-01", 1, 3.00, strike="105", expiry="2025-07-18",
+                  pc="C", underlying="UNRL"),
+        make_assignment("2025-07-18", 1, strike="105", expiry="2025-07-18",
+                        pc="C", underlying="UNRL"),
+        # Unabhaengiger Verkauf am SELBEN Tag, VOR der Andienungs-Row, Verlust-Row
+        _call_stk_row("UNRL", "unrl_unrelated_sale", "SELL", "C", -100,
+                      "2025-07-18", -80.0, tt="ExchTrade"),
+        # Andienungs-Verkauf (BookTrade): PnL = 50 echt + 299 Praemie
+        _call_stk_row("UNRL", "unrl_assignment_sale", "SELL", "C", -100,
+                      "2025-07-18", 349.0, tt="BookTrade"),
+    ]
+    rd = calculate_for_trades(trades, tax_year=2025)
+
+    rows = {r["transactionType"]: r for r in rd["trade_details"]
+            if r.get("symbol") == "UNRL" and r.get("source") == "trades"}
+    unrelated = rows["ExchTrade"]
+    assignment = rows["BookTrade"]
+    assert not unrelated.get("stillhalter_adjusted"), \
+        "TC30: fremde Same-Day-Row darf NICHT korrigiert werden"
+    assert_close(unrelated["fifoPnlRealized"], -80.0, label="TC30 fremde Row pnl")
+    assert assignment.get("stillhalter_adjusted"), \
+        "TC30: Andienungs-Row (BookTrade) muss die Korrektur erhalten"
+    assert_close(assignment["fifoPnlRealized"], 50.0, label="TC30 assignment pnl")
+    assert_close(rd.get("stocks_gain_eur", 0), 50.0, label="TC30 stocks_gain")
+    assert_close(rd.get("stocks_loss_eur", 0), -80.0, label="TC30 stocks_loss")
+
+    print("  TC30 Call-Korrektur trifft Andienungs-Row, nicht fremde Same-Day-Row: OK")
+    print("    BookTrade 349 -> 50, fremde ExchTrade-Row -80 unveraendert")
+
+
+def test_put_correction_prefers_matching_lot_cost_row():
+    """TC32: Put-Korrektur waehlt unter Same-Day-Verkaeufen die Lot-passende Row.
+
+    Gleiche Klasse wie TC30 fuer Puts: zwei Verkaeufe am Lot-close_date; die
+    Row mit der Lot-Kostenbasis (9801 = Strike - Praemie) ist das echte Ziel,
+    nicht die fremde Verlust-Row, die zufaellig zuerst in debug_rows steht.
+    """
+    trades = [
+        make_sell("2025-06-02", 1, 2.00, strike="100", expiry="2025-06-20",
+                  pc="P", underlying="PREF"),
+        make_assignment("2025-06-20", 1, strike="100", expiry="2025-06-20",
+                        pc="P", underlying="PREF"),
+        {
+            "tradeID": "pref_assignment_buy",
+            "assetCategory": "STK", "transactionType": "BookTrade", "buySell": "BUY",
+            "openCloseIndicator": "O", "underlyingSymbol": "PREF", "symbol": "PREF",
+            "description": "PREF CORP", "quantity": "100",
+            "tradePrice": "100", "closePrice": "98", "ibCommission": "0",
+            "fxRateToBase": "1.0", "currency": "EUR",
+            "dateTime": "2025-06-20 16:20:00", "tradeDate": "2025-06-20",
+            "reportDate": "2025-06-20", "fifoPnlRealized": "0",
+            "cost": "9801", "proceeds": "-9801",
+        },
+        # Fremder Alt-Bestands-Verkauf am selben Tag (Verlust, cost 5000), zuerst
+        {
+            "tradeID": "pref_unrelated_sale",
+            "assetCategory": "STK", "transactionType": "ExchTrade", "buySell": "SELL",
+            "openCloseIndicator": "C", "underlyingSymbol": "PREF", "symbol": "PREF",
+            "description": "PREF CORP", "quantity": "-100",
+            "tradePrice": "49.2", "closePrice": "49.2", "ibCommission": "0",
+            "fxRateToBase": "1.0", "currency": "EUR",
+            "dateTime": "2025-07-10 10:00:00", "tradeDate": "2025-07-10",
+            "reportDate": "2025-07-10", "fifoPnlRealized": "-80",
+            "cost": "5000", "proceeds": "4920",
+        },
+        # Echter Verkauf des angedienten Bestands (cost 9801 = reduzierte Basis)
+        {
+            "tradeID": "pref_real_sale",
+            "assetCategory": "STK", "transactionType": "ExchTrade", "buySell": "SELL",
+            "openCloseIndicator": "C", "underlyingSymbol": "PREF", "symbol": "PREF",
+            "description": "PREF CORP", "quantity": "-100",
+            "tradePrice": "100", "closePrice": "100", "ibCommission": "0",
+            "fxRateToBase": "1.0", "currency": "EUR",
+            "dateTime": "2025-07-10 11:00:00", "tradeDate": "2025-07-10",
+            "reportDate": "2025-07-10", "fifoPnlRealized": "199",
+            "cost": "9801", "proceeds": "10000",
+        },
+    ]
+    closed_lots = [{
+        "assetCategory": "STK", "currency": "EUR",
+        "reportDate": "2025-07-10", "dateTime": "2025-07-10 11:00:00",
+        "openDateTime": "2025-06-20 16:20:00",
+        "quantity": "100", "buySell": "SELL", "cost": "9801",
+        "fifoPnlRealized": "199", "fxRateToBase": "1.0",
+        "symbol": "PREF", "underlyingSymbol": "PREF",
+    }]
+    rd = calculate_for_trades(trades, tax_year=2025, closed_lots=closed_lots)
+
+    rows = {r["tradePrice"]: r for r in rd["trade_details"]
+            if r.get("symbol") == "PREF" and r.get("source") == "trades"
+            and r.get("buySell") == "SELL"}
+    unrelated = rows[49.2]
+    real = rows[100.0]
+    assert not unrelated.get("stillhalter_adjusted"), \
+        "TC32: fremde Row (cost 5000) darf NICHT korrigiert werden"
+    assert_close(unrelated["fifoPnlRealized"], -80.0, label="TC32 fremde Row pnl")
+    assert real.get("stillhalter_adjusted"), \
+        "TC32: Lot-passende Row (cost 9801) muss korrigiert werden"
+    assert_close(real["fifoPnlRealized"], 0.0, label="TC32 echte Row pnl")
+    assert_close(rd.get("stocks_gain_eur", 0), 0.0, label="TC32 stocks_gain")
+    assert_close(rd.get("stocks_loss_eur", 0), -80.0, label="TC32 stocks_loss")
+
+    print("  TC32 Put-Korrektur waehlt Lot-passende Row (cost-Match): OK")
+    print("    Echte Row 199 -> 0, fremde Row -80 unveraendert")
+
+
+def test_worthless_expiry_without_history_warns_unmatched():
+    """TC31: Verfall eines Vorjahres-Shorts OHNE geladene History muss warnen.
+
+    Codex-Review Finding (4. Runde, P2): Der Missing-History-Detektor scannte
+    nur ExchTrade-BUYs. Ein BookTrade-Verfall (PnL = Praemie) ohne Eroeffnungs-
+    SELL im Datensatz blieb unbemerkt, obwohl die Praemie doppelt versteuert
+    wird (Zufluss im Vorjahr + Verfalls-PnL im Steuerjahr).
+    """
+    trades = [
+        # NUR der Verfall — der 2024-SELL fehlt (keine --history geladen)
+        make_expiry("2025-01-17", 1, 499.0, strike="100", expiry="2025-01-17",
+                    underlying="NOHIST"),
+    ]
+    rd = calculate_for_trades(trades, tax_year=2025)
+
+    unmatched = rd["audit"].get("zufluss_unmatched", [])
+    assert len(unmatched) == 1, \
+        f"TC31: erwartet 1 zufluss_unmatched-Eintrag, aktuell {unmatched}"
+    assert unmatched[0]["underlyingSymbol"] == "NOHIST"
+    # PnL bleibt (ohne History unvermeidbar) voll in options_gain
+    assert_close(rd.get("options_gain_eur", 0), 499.0, label="TC31 options_gain")
+
+    print("  TC31 Verfall ohne Vorjahres-XML erzeugt zufluss_unmatched-Warnung: OK")
+    print("    NOHIST 499.00 als doppelt-versteuert-Risiko gemeldet")
+
+
 if __name__ == "__main__":
     test_cross_year_put_series()
     test_cross_year_call_series()
@@ -1136,4 +1807,17 @@ if __name__ == "__main__":
     test_cross_year_put_correction_handles_spaced_underlying_symbol()
     test_cross_year_worthless_expiry_gets_prior_zufluss_correction()
     test_same_year_worthless_expiry_no_correction()
-    print("\nOK: alle 19 TCs gruen")
+    test_call_assignment_correction_only_hits_assignment_day_sale()
+    test_put_and_call_premium_stack_on_same_stock_row()
+    test_unapplied_correction_is_tracked_and_warned()
+    test_call_assignment_short_cover_correction_on_buy_row()
+    test_two_same_day_call_assignments_use_separate_cover_lots()
+    test_two_same_day_put_assignments_use_separate_lots()
+    test_call_short_cover_without_closed_lots_falls_back_to_trades()
+    test_call_cover_with_partial_closed_lots()
+    test_call_assignment_mixed_long_and_short_without_lots()
+    test_call_assignment_open_short_is_not_an_error()
+    test_call_correction_targets_assignment_row_not_unrelated_same_day_trade()
+    test_worthless_expiry_without_history_warns_unmatched()
+    test_put_correction_prefers_matching_lot_cost_row()
+    print("\nOK: alle 32 TCs gruen")

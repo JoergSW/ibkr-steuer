@@ -993,8 +993,21 @@ def _put_assignment_relevant_dates(det):
     return dates
 
 
-def _put_assignment_closed_lot_matches(closed_lots, det, underlying, shares):
-    """Return STK closed-lot slices that originate from this put assignment."""
+def _symbol_root(value):
+    """Erstes Token eines IBKR-Symbols ('BRK B' -> 'BRK'); leer-sicher."""
+    parts = (value or '').split()
+    return parts[0] if parts else ''
+
+
+def _put_assignment_closed_lot_matches(closed_lots, det, underlying, shares, consumed=None):
+    """Return STK closed-lot slices that originate from this put assignment.
+
+    `consumed` (optional dict, key: id(lot)) trackt bereits geclaimte Lot-Shares
+    über mehrere Details hinweg. Ohne geteilten State claimen zwei Same-Day-
+    Andienungen desselben Underlyings denselben Lot-Slice doppelt, die zweite
+    Korrektur verfällt und der spätere Verkauf behält die eingebettete Prämie
+    (Audit-Finding F3 / Codex-Review P2).
+    """
     if det.get('putCall') != 'P':
         return []
 
@@ -1009,7 +1022,7 @@ def _put_assignment_closed_lot_matches(closed_lots, det, underlying, shares):
             break
         if lot.get('assetCategory') != 'STK':
             continue
-        sym = (lot.get('underlyingSymbol') or lot.get('symbol', '')).split()[0]
+        sym = _symbol_root(lot.get('underlyingSymbol') or lot.get('symbol'))
         if sym != underlying:
             continue
         open_date = (lot.get('openDateTime') or '')[:10]
@@ -1018,7 +1031,10 @@ def _put_assignment_closed_lot_matches(closed_lots, det, underlying, shares):
         qty = abs(safe_float(lot.get('quantity'), 0))
         if qty <= 0:
             continue
-        take = min(qty, remaining)
+        avail = qty if consumed is None else qty - consumed.get(id(lot), 0.0)
+        if avail <= 0:
+            continue
+        take = min(avail, remaining)
         close_date = (lot.get('reportDate') or lot.get('dateTime') or '')[:10]
         matches.append({
             'shares': take,
@@ -1026,13 +1042,349 @@ def _put_assignment_closed_lot_matches(closed_lots, det, underlying, shares):
             'open_date': open_date,
             'close_date': close_date,
         })
+        if consumed is not None:
+            consumed[id(lot)] = consumed.get(id(lot), 0.0) + take
         remaining -= take
     return matches
 
 
+def _call_assignment_short_lot_matches(closed_lots, det, underlying, shares, consumed=None):
+    """Return STK short closed-lot slices opened by this call assignment.
+
+    Call-Andienung ohne Long-Bestand eröffnet einen Aktien-Short (SELL mit PnL=0,
+    openClose=O); erst der spätere Rückkauf realisiert den PnL inkl. eingebetteter
+    Prämie. Solche Lots haben openDateTime == Andienungstag und Short-Richtung
+    (negative Quantity / schließender buySell=BUY). Die Korrektur muss dann auf
+    die BUY-Row des Cover-Tags, nicht auf den Andienungstag (Audit-Finding F1,
+    SPY/BITO/MPW-Fälle). `consumed` wie bei _put_assignment_closed_lot_matches:
+    geteilter Lot-Konsum-State gegen Doppel-Claims durch Same-Day-Details
+    (Codex-Review P2).
+    """
+    if det.get('putCall') != 'C':
+        return []
+
+    remaining = abs(safe_float(shares, 0))
+    if remaining <= 0:
+        return []
+
+    relevant_dates = _put_assignment_relevant_dates(det)
+    matches = []
+    for lot in sorted(closed_lots, key=lambda x: x.get('dateTime') or x.get('reportDate') or ''):
+        if remaining <= 0:
+            break
+        if lot.get('assetCategory') != 'STK':
+            continue
+        sym = _symbol_root(lot.get('underlyingSymbol') or lot.get('symbol'))
+        if sym != underlying:
+            continue
+        is_short_lot = (safe_float(lot.get('quantity'), 0) < 0
+                        or (lot.get('buySell') or '').upper() == 'BUY')
+        if not is_short_lot:
+            continue
+        open_date = (lot.get('openDateTime') or '')[:10]
+        if relevant_dates and open_date not in relevant_dates:
+            continue
+        qty = abs(safe_float(lot.get('quantity'), 0))
+        if qty <= 0:
+            continue
+        avail = qty if consumed is None else qty - consumed.get(id(lot), 0.0)
+        if avail <= 0:
+            continue
+        take = min(avail, remaining)
+        close_date = (lot.get('reportDate') or lot.get('dateTime') or '')[:10]
+        matches.append({
+            'shares': take,
+            'open_date': open_date,
+            'close_date': close_date,
+        })
+        if consumed is not None:
+            consumed[id(lot)] = consumed.get(id(lot), 0.0) + take
+        remaining -= take
+    return matches
+
+
+def _call_short_cover_candidates_from_trades(trades, underlying, after_dates, shares, consumed=None):
+    """Fallback ohne CLOSED_LOT-Daten: Short-Cover-Kandidaten direkt aus trades.
+
+    Wenn closed_lots.csv fehlt oder das Short-Lot nicht enthält, ist der
+    Lot-Match leer — die Cover-BUYs (PnL≠0) nach dem Andienungstag sind aber in
+    trades.csv selbst sichtbar. Chronologisch früheste zuerst (trades.csv ist
+    NICHT chronologisch sortiert). Ohne diesen Fallback bliebe die Prämie im
+    Cover-PnL eingebettet und würde doppelt versteuert (Codex-Review Finding 2).
+    `consumed` wie bei den Lot-Matchern (Doppel-Claim-Schutz, key id(trade)).
+    """
+    remaining = abs(safe_float(shares, 0))
+    after = min([d for d in after_dates if d]) if after_dates else ''
+    if remaining <= 0 or not after:
+        return []
+
+    candidates = []
+    for t in trades:
+        if t.get('assetCategory') != 'STK':
+            continue
+        sym = _symbol_root(t.get('symbol'))
+        if sym != underlying:
+            continue
+        if (t.get('buySell') or '').upper() != 'BUY':
+            continue
+        if abs(safe_float(t.get('fifoPnlRealized'))) < 0.01:
+            continue  # Opening-Kauf ohne realisierten PnL — kein Cover
+        t_date = (t.get('reportDate') or t.get('dateTime') or '')[:10]
+        if not t_date or t_date <= after:
+            continue
+        candidates.append((t_date, t))
+
+    matches = []
+    for t_date, t in sorted(candidates, key=lambda x: x[0]):
+        if remaining <= 0:
+            break
+        qty = abs(safe_float(t.get('quantity'), 0))
+        if qty <= 0:
+            continue
+        ckey = (id(t), 'C')
+        avail = qty if consumed is None else qty - consumed.get(ckey, 0.0)
+        if avail <= 0:
+            continue
+        take = min(avail, remaining)
+        matches.append({'shares': take, 'close_date': t_date, 'oid': id(t)})
+        if consumed is not None:
+            consumed[ckey] = consumed.get(ckey, 0.0) + take
+        remaining -= take
+    return matches
+
+
+def _consume_assignment_day_stock_sells(trades, underlying, day_dates, max_shares, consumed, realized):
+    """Konsumiere STK-SELL-Rows am Andienungstag quantity-genau (FIFO).
+
+    realized=True: Rows mit |fifoPnlRealized| ≥ 0.01 — der Long-Close-Anteil
+    der Andienung, dessen PnL (inkl. eingebetteter Prämie) sofort realisiert ist.
+    realized=False: Rows mit PnL≈0 — die Short-Eröffnung; Evidenz dafür, dass
+    dieser Anteil der Andienung als offener Short weiterlebt.
+    `consumed` (key id(trade)) verhindert Doppel-Zählung über mehrere Details.
+
+    BookTrade-Rows zuerst: Der Aktien-Trade einer Andienung ist ein BookTrade
+    (nicht-börslicher Buchungsvorgang) — unabhängige Verkäufe am selben Tag
+    sind ExchTrades und dürfen die Korrektur nicht an sich ziehen.
+    Returns (taken_shares, row_oids).
+    """
+    remaining = abs(safe_float(max_shares, 0))
+    if remaining <= 0 or not day_dates:
+        return 0.0, set()
+
+    candidates = []
+    for idx, t in enumerate(trades):
+        if t.get('assetCategory') != 'STK':
+            continue
+        sym = _symbol_root(t.get('symbol'))
+        if sym != underlying:
+            continue
+        if (t.get('buySell') or '').upper() != 'SELL':
+            continue
+        has_pnl = abs(safe_float(t.get('fifoPnlRealized'))) >= 0.01
+        if realized != has_pnl:
+            continue
+        t_date = (t.get('reportDate') or '')[:10]
+        t_date2 = (t.get('dateTime') or '')[:10]
+        if t_date not in day_dates and t_date2 not in day_dates:
+            continue
+        is_booktrade = t.get('transactionType') == 'BookTrade'
+        candidates.append((0 if is_booktrade else 1, t_date or t_date2, idx, t))
+
+    taken = 0.0
+    oids = set()
+    for _bt, _d, _idx, t in sorted(candidates, key=lambda x: (x[0], x[1], x[2])):
+        if remaining <= 0:
+            break
+        qty = abs(safe_float(t.get('quantity'), 0))
+        if qty <= 0:
+            continue
+        ckey = (id(t), 'C')
+        avail = qty - consumed.get(ckey, 0.0)
+        if avail <= 0:
+            continue
+        take = min(avail, remaining)
+        consumed[ckey] = consumed.get(ckey, 0.0) + take
+        oids.add(id(t))
+        taken += take
+        remaining -= take
+    return taken, oids
+
+
+def _claim_stock_rows_for_date(trades, underlying, close_date, shares, consumed,
+                               buysell, prefer_cost=None, claim_side='C'):
+    """Beansprucht STK-Rows (PnL≠0) der Richtung `buysell` am close_date und
+    liefert deren Row-Identitäten (id(trade)) zurück.
+
+    Zwei Zwecke: (1) Lots und trades-Rows beschreiben dieselbe Realität — ohne
+    Claiming würde der trades-Fallback eines anderen Details bereits per Lot
+    zugeordnete Shares erneut vergeben. (2) Die zurückgegebenen OIDs erlauben
+    dem Apply, exakt diese Rows zu treffen statt der ersten Same-Day-Row in
+    Dateireihenfolge (fremde Trades am selben Tag dürfen die Korrektur nicht
+    konsumieren — Codex-Review 4. Runde).
+
+    `prefer_cost` (Put-Pfad): bevorzugt die Row, deren Kostenbasis der
+    Lot-Basis entspricht — die Andienungs-Lots tragen die charakteristische
+    (Strike − Prämie)-Basis; fremde Same-Day-Verkäufe nicht. Tie-Break: FIFO.
+    """
+    remaining = abs(safe_float(shares, 0))
+    if remaining <= 0 or not close_date:
+        return set()
+
+    candidates = []
+    for idx, t in enumerate(trades):
+        if t.get('assetCategory') != 'STK':
+            continue
+        sym = _symbol_root(t.get('symbol'))
+        if sym != underlying:
+            continue
+        if (t.get('buySell') or '').upper() != buysell:
+            continue
+        if abs(safe_float(t.get('fifoPnlRealized'))) < 0.01:
+            continue
+        t_date = (t.get('reportDate') or t.get('dateTime') or '')[:10]
+        if t_date != close_date:
+            continue
+        if prefer_cost is not None:
+            cost_mismatch = abs(abs(safe_float(t.get('cost'), 0)) - abs(prefer_cost))
+        else:
+            cost_mismatch = 0.0
+        candidates.append((cost_mismatch, idx, t))
+
+    claimed_oids = set()
+    for _mismatch, _idx, t in sorted(candidates, key=lambda x: (x[0], x[1])):
+        if remaining <= 0:
+            break
+        qty = abs(safe_float(t.get('quantity'), 0))
+        # Seiten-getrennte Claims (analog remaining_by_side im Apply): dieselbe
+        # Row darf Put- UND Call-Praemie tragen (Wheel: Put-Andienung kauft,
+        # Call-Andienung verkauft dieselben Shares) — ein seitenloser Claim
+        # liesse die Call-Stufe-2 auf fremde Covers ausweichen (IWM/BITO).
+        ckey = (id(t), claim_side)
+        avail = qty - consumed.get(ckey, 0.0)
+        if avail <= 0:
+            continue
+        take = min(avail, remaining)
+        consumed[ckey] = consumed.get(ckey, 0.0) + take
+        claimed_oids.add(id(t))
+        remaining -= take
+    return claimed_oids
+
+
+def _resolve_call_assignment_targets(trades, closed_lots, det, underlying, total_shares, consumed):
+    """Löst eine Call-Andienung ANTEILIG in Korrektur-Ziele auf (kein binäres Gate).
+
+    IBKR realisiert den Aktien-PnL einer Call-Andienung (inkl. eingebetteter
+    Prämie) je nach Bestand an unterschiedlichen Stellen — auch gemischt
+    innerhalb EINER Andienung. Quellen-Kaskade, jede Stufe konsumiert nur den
+    noch offenen Rest (Audit F1 + Codex-Findings 1–3):
+
+      1. Short-Cover-Lots (openDateTime == Andienungstag) → BUY @ lot.close_date.
+         Beansprucht zusätzlich die korrespondierenden Cover-Rows in `consumed`.
+      2. Long-Close-Anteil: SELL-Rows am Andienungstag mit PnL≠0 → SELL @ Tag.
+      3. Restliche Cover-BUYs (PnL≠0, nach Andienungstag) direkt aus trades —
+         deckt fehlende UND unvollständige closed_lots ab.
+      4. Short-Open-Evidenz (SELL @ Tag, PnL≈0) ohne Cover im Steuerjahr →
+         Position offen, PnL unrealisiert → bewusst KEINE Korrektur, kein Fehler.
+
+    Returns (targets, open_short_shares, unresolved_shares):
+      targets: [{'shares', 'close_dates', 'target_buysell'}]
+      open_short_shares: Anteil mit offenem Short (→ stillhalter_open_short)
+      unresolved_shares: Rest ohne jede Evidenz (→ Anomalie, dropped+Warnung)
+    """
+    call_dates = sorted({
+        (det.get('assignment_date') or '')[:10],
+        (det.get('assignment_trade_date') or '')[:10],
+    } - {''})
+    rest = abs(safe_float(total_shares, 0))
+    targets = []
+    if rest <= 0 or not call_dates:
+        return targets, 0.0, rest
+
+    # Stufe 1: Short-Cover-Lots (autoritativste Quelle). Die OIDs der
+    # korrespondierenden Cover-Rows wandern mit ins Target, damit das Apply
+    # exakt diese Rows trifft (und Stufe 3 anderer Details sie nicht doppelt
+    # vergibt).
+    for match in _call_assignment_short_lot_matches(closed_lots, det, underlying,
+                                                    rest, consumed=consumed):
+        row_oids = _claim_stock_rows_for_date(trades, underlying,
+                                              match['close_date'],
+                                              match['shares'], consumed,
+                                              buysell='BUY')
+        targets.append({'shares': match['shares'],
+                        'close_dates': [match['close_date']],
+                        'target_buysell': 'BUY',
+                        'row_oids': row_oids or None})
+        rest -= match['shares']
+
+    # Stufe 2: Long-Close-Anteil am Andienungstag (BookTrade-Rows bevorzugt —
+    # fremde ExchTrades am selben Tag dürfen die Korrektur nicht erhalten).
+    if rest > 0:
+        long_qty, long_oids = _consume_assignment_day_stock_sells(
+            trades, underlying, call_dates, rest, consumed, realized=True)
+        if long_qty > 0:
+            targets.append({'shares': long_qty,
+                            'close_dates': call_dates,
+                            'target_buysell': 'SELL',
+                            'row_oids': long_oids or None})
+            rest -= long_qty
+
+    # Stufe 3: restliche Covers aus trades (closed_lots fehlt oder ist lückenhaft).
+    if rest > 0:
+        for match in _call_short_cover_candidates_from_trades(
+                trades, underlying, call_dates, rest, consumed=consumed):
+            targets.append({'shares': match['shares'],
+                            'close_dates': [match['close_date']],
+                            'target_buysell': 'BUY',
+                            'row_oids': {match['oid']}})
+            rest -= match['shares']
+
+    # Stufe 4: offener Short (Short-Open-Evidenz, kein Cover im Steuerjahr).
+    open_short = 0.0
+    if rest > 0:
+        open_short, _open_oids = _consume_assignment_day_stock_sells(
+            trades, underlying, call_dates, rest, consumed, realized=False)
+        rest -= open_short
+
+    return targets, open_short, rest
+
+
+def _correction_matches_row(corr, row):
+    """Gate: Darf diese pending-Korrektur auf diese debug_row angewendet werden?
+
+    Drei Stufen, stärkste zuerst:
+    1. `row_oids`: Der Resolver hat die Ziel-Row bereits identifiziert — nur
+       exakt diese Row darf die Korrektur erhalten (fremde Same-Day-Trades
+       bleiben unberührt).
+    2. `close_dates` (+ optional `target_buysell`): Fallback ohne Row-Identität
+       (z.B. unresolved-Anomalie) — Datum + Richtung.
+    3. `close_date` (Put-Pfad ohne OIDs): einzelnes Datum gegen das erste
+       nicht-leere Row-Datum. ACHTUNG: bewusst first-nonempty (reportDate vor
+       dateTime), NICHT Set-Schnitt wie Stufe 2 — delayed bookings (1a13795)
+       würden sonst zusätzlich über dateTime matchen.
+    """
+    corr_oids = corr.get('row_oids')
+    if corr_oids is not None:
+        return row.get('_trade_oid') in corr_oids
+    if corr.get('close_dates') is not None:
+        target_bs = corr.get('target_buysell', '')
+        if target_bs and (row.get('buySell') or '').upper() != target_bs:
+            return False
+        row_dates = {(row.get('reportDate') or '')[:10],
+                     (row.get('dateTime') or '')[:10]} - {''}
+        return bool(row_dates & set(corr.get('close_dates')))
+    corr_close_date = corr.get('close_date') or ''
+    row_close_date = (row.get('reportDate') or row.get('dateTime') or '')[:10]
+    return not corr_close_date or corr_close_date == row_close_date
+
+
 def _put_assignment_lot_cost_correction_per_share(closed_lots, det, underlying, shares, default_per_share,
-                                                  require_match=False):
-    """Use realized STK lot cost to decide whether IBKR embedded the put premium."""
+                                                  require_match=False, matches=None):
+    """Use realized STK lot cost to decide whether IBKR embedded the put premium.
+
+    `matches`: vorberechnete Lot-Matches durchreichen, wenn der Aufrufer bereits
+    mit geteiltem Konsum-State gematcht hat — ein interner Neu-Scan würde sonst
+    Lots doppelt konsumieren bzw. eine abweichende Zuordnung sehen.
+    """
     if det.get('putCall') != 'P':
         return default_per_share
 
@@ -1041,7 +1393,8 @@ def _put_assignment_lot_cost_correction_per_share(closed_lots, det, underlying, 
     if shares <= 0 or strike <= 0:
         return default_per_share
 
-    matches = _put_assignment_closed_lot_matches(closed_lots, det, underlying, shares)
+    if matches is None:
+        matches = _put_assignment_closed_lot_matches(closed_lots, det, underlying, shares)
     lot_qty = sum(m['shares'] for m in matches)
     lot_cost = sum(m['cost'] for m in matches)
 
@@ -1375,6 +1728,11 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             'multiplier': t.get('multiplier', ''),
             'underlyingSymbol': t.get('underlyingSymbol', ''),
             'source': 'trades',
+            # Interne Row-Identität (id des Quell-Trades): erlaubt dem
+            # Stillhalter-Apply, exakt die vom Resolver konsumierte Row zu
+            # treffen statt der ersten Same-Day-Row in Dateireihenfolge.
+            # Unterstrich-Felder werden nicht exportiert und nach dem Apply entfernt.
+            '_trade_oid': id(t),
         })
 
     # Write debug CSV
@@ -1382,7 +1740,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         import csv as csv_mod
         debug_path = os.path.join(ib_tax_dir, 'trades_debug_eur.csv')
         with open(debug_path, 'w', newline='', encoding='utf-8') as f:
-            w = csv_mod.DictWriter(f, fieldnames=debug_rows[0].keys())
+            export_fields = [k for k in debug_rows[0].keys() if not k.startswith('_')]
+            w = csv_mod.DictWriter(f, fieldnames=export_fields, extrasaction='ignore')
             w.writeheader()
             w.writerows(debug_rows)
         print(f"Debug: {len(debug_rows)} Trades mit EUR-Umrechnung → {debug_path}")
@@ -1402,6 +1761,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     stillhalter_premium_eur = 0.0
     stillhalter_count = 0
     stillhalter_unmatched = []
+    stillhalter_corrections_dropped = []
+    stillhalter_open_short = []
     stillhalter_details = []
 
     opt_assignments = [t for t in trades
@@ -1576,6 +1937,13 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         stk_premium = 0.0
         etf_premium = 0.0
         put_nosell_premium = 0.0  # put assignment premiums where stock was NOT sold
+        # Geteilter Lot-Konsum-State pro Schleife: ohne ihn claimen zwei Same-Day-
+        # Andienungen desselben Underlyings denselben Lot-Slice (F3 / Codex P2).
+        # Key-Invariante (gilt auch fuer _correction_lot_claims): closed_lots
+        # claimen seitenlos per id(lot) — Put- und Call-Andienungen treffen
+        # richtungsdisjunkte Lots; trades-Rows claimen seitengetrennt per
+        # (id(trade), 'P'/'C') — dieselbe Row traegt im Wheel-Fall beide Praemien.
+        _routing_lot_claims = {}
         for det in stillhalter_details:
             underlying = det['symbol'].split()[0] if det['symbol'] else ''
             underlying_isin = symbol_to_isin.get(underlying, '')
@@ -1587,7 +1955,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 total_shares = det['quantity'] * det.get('multiplier', 100)
                 matched_shares = sum(
                     m['shares'] for m in _put_assignment_closed_lot_matches(
-                        closed_lots_for_put_basis, det, underlying, total_shares
+                        closed_lots_for_put_basis, det, underlying, total_shares,
+                        consumed=_routing_lot_claims
                     )
                 )
                 if matched_shares <= 0:
@@ -1618,6 +1987,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         # Instead of separate Korrektur rows, we directly fix the stock trade's
         # cost/fifoPnlRealized/pnl_eur so the Excel shows the correct per-trade values.
         pending_stk_corrections = {}  # underlying_symbol → list of corrections
+        # Eigener Konsum-State für diese Schleife (gleiche det-Reihenfolge und
+        # Lot-Sortierung wie oben → identische Zuordnung wie das Routing).
+        _correction_lot_claims = {}
         for det in stillhalter_details:
             underlying = det['symbol'].split()[0] if det['symbol'] else ''
             u_isin = symbol_to_isin.get(underlying, '')
@@ -1627,7 +1999,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             put_lot_matches = []
             if det['putCall'] == 'P':
                 put_lot_matches = _put_assignment_closed_lot_matches(
-                    closed_lots_for_put_basis, det, underlying, total_shares_for_put
+                    closed_lots_for_put_basis, det, underlying, total_shares_for_put,
+                    consumed=_correction_lot_claims
                 )
             if det['putCall'] == 'P' and not put_lot_matches:
                 source_topf = 'Topf2'  # put_nosell: premium only in Topf 2, no subtraction
@@ -1663,22 +2036,73 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 if det['putCall'] == 'P':
                     premium_per_share_raw = _put_assignment_lot_cost_correction_per_share(
                         closed_lots_for_put_basis, det, underlying, total_shares,
-                        premium_per_share_raw, require_match=True
+                        premium_per_share_raw, require_match=True,
+                        matches=put_lot_matches
                     )
                     if premium_per_share_raw is None:
                         continue
                     for match in put_lot_matches:
+                        # Row-Identität der Ziel-Verkaufszeile: cost-präferiert
+                        # (die Andienungs-Lots tragen die charakteristische
+                        # Strike−Prämie-Basis), damit fremde Same-Day-Verkäufe
+                        # die Korrektur nicht konsumieren.
+                        put_row_oids = _claim_stock_rows_for_date(
+                            trades, underlying, match['close_date'],
+                            match['shares'], _correction_lot_claims,
+                            buysell='SELL', prefer_cost=match.get('cost'),
+                            claim_side='P'
+                        )
                         pending_stk_corrections.setdefault(underlying, []).append({
                             'premium_per_share_raw': premium_per_share_raw,
                             'remaining_shares': match['shares'],
                             'close_date': match['close_date'],
+                            'side': 'P',
+                            'row_oids': put_row_oids or None,
                         })
                 else:
-                    pending_stk_corrections.setdefault(underlying, []).append({
-                        'premium_per_share_raw': premium_per_share_raw,
-                        'remaining_shares': total_shares,
-                        'close_date': '',
-                    })
+                    # Anteilige Quellen-Kaskade statt binärer Gates (Audit F1 +
+                    # Codex-Findings 1–3): Jede Call-Andienung wird quantity-genau
+                    # in Ziele aufgelöst; offene Shorts sind kein Fehler.
+                    call_targets, open_short_shares, unresolved_shares = \
+                        _resolve_call_assignment_targets(
+                            trades, closed_lots_for_put_basis, det, underlying,
+                            total_shares, consumed=_correction_lot_claims
+                        )
+                    for tgt in call_targets:
+                        pending_stk_corrections.setdefault(underlying, []).append({
+                            'premium_per_share_raw': premium_per_share_raw,
+                            'remaining_shares': tgt['shares'],
+                            'close_dates': tgt['close_dates'],
+                            'side': 'C',
+                            'target_buysell': tgt['target_buysell'],
+                            'row_oids': tgt.get('row_oids'),
+                        })
+                    if open_short_shares > 0:
+                        stillhalter_open_short.append({
+                            'underlying': underlying,
+                            'shares': open_short_shares,
+                            'premium_raw': premium_per_share_raw * open_short_shares,
+                            'assignment_date': (det.get('assignment_date') or '')[:10],
+                        })
+                        print(f"  (i) Stillhalter {underlying}: Short aus Call-Andienung "
+                              f"({open_short_shares:g} Stück) am Jahresende noch offen — "
+                              f"Aktien-PnL unrealisiert, keine Korrektur nötig. Beim "
+                              f"Folgejahr-Lauf dieses XML per --history laden, damit die "
+                              f"Prämie dort nicht doppelt versteuert wird.")
+                    if unresolved_shares > 0:
+                        # Keine Evidenz in Lots ODER trades (Anomalie) → bisheriger
+                        # SELL-Fallback; läuft kontrolliert in dropped + Warnung.
+                        call_dates = sorted({
+                            (det.get('assignment_date') or '')[:10],
+                            (det.get('assignment_trade_date') or '')[:10],
+                        } - {''})
+                        pending_stk_corrections.setdefault(underlying, []).append({
+                            'premium_per_share_raw': premium_per_share_raw,
+                            'remaining_shares': unresolved_shares,
+                            'close_dates': call_dates,
+                            'side': 'C',
+                            'target_buysell': 'SELL',
+                        })
 
         # Apply pending corrections to stock trade debug_rows
         # IBKR embeds the premium in the stock's cost basis → cost too low, G/V too high.
@@ -1704,18 +2128,21 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 continue
             original_pnl_eur = row['pnl_eur']
             total_correction_raw = 0.0
-            remaining_qty = qty
+            # Put- (Kostenbasis-) und Call-Korrekturen (Erlösseite) zählen getrennte
+            # Quantity-Budgets: dieselben Shares tragen legitim BEIDE Prämien, wenn
+            # die Aktie per Put-Andienung gekauft und per Call-Andienung verkauft
+            # wurde (Audit-Finding F1b, IWM-Fall).
+            remaining_by_side = {'P': qty, 'C': qty}
             for corr in pending_stk_corrections[row_symbol]:
-                if corr['remaining_shares'] <= 0 or remaining_qty <= 0:
+                side = corr.get('side', 'P')
+                if corr['remaining_shares'] <= 0 or remaining_by_side[side] <= 0:
                     continue
-                corr_close_date = corr.get('close_date') or ''
-                row_close_date = (row.get('reportDate') or row.get('dateTime') or '')[:10]
-                if corr_close_date and corr_close_date != row_close_date:
+                if not _correction_matches_row(corr, row):
                     continue
-                shares = min(remaining_qty, corr['remaining_shares'])
+                shares = min(remaining_by_side[side], corr['remaining_shares'])
                 total_correction_raw += corr['premium_per_share_raw'] * shares
                 corr['remaining_shares'] -= shares
-                remaining_qty -= shares
+                remaining_by_side[side] -= shares
             if total_correction_raw > 0:
                 # IBKR reduced absolute cost by premium → restore it
                 if row['cost'] >= 0:
@@ -1769,6 +2196,31 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 else:
                     stk_gain_corr_cy += from_gain
                     stk_loss_corr_cy += from_loss
+
+        # Nicht zugeordnete Korrekturen sichtbar machen (Audit-Finding F1c): die
+        # Prämie ist bereits in Topf 2 gebucht, aber im Aktien-/ETF-PnL noch
+        # eingebettet → ohne Gegen-Korrektur Doppelversteuerung. Niemals still
+        # verwerfen.
+        for _underlying, _corrs in pending_stk_corrections.items():
+            _leftover_raw = sum(c['premium_per_share_raw'] * c['remaining_shares']
+                                for c in _corrs if c['remaining_shares'] > 0)
+            if _leftover_raw > 0.01:
+                _leftover_shares = sum(c['remaining_shares'] for c in _corrs
+                                       if c['remaining_shares'] > 0)
+                stillhalter_corrections_dropped.append({
+                    'underlying': _underlying,
+                    'leftover_shares': _leftover_shares,
+                    'leftover_raw': _leftover_raw,
+                })
+                print(f"  (!) WARNUNG: Stillhalter-Korrektur für {_underlying} nicht "
+                      f"vollständig zugeordnet: {_leftover_raw:,.2f} (Handelswährung) auf "
+                      f"{_leftover_shares:g} Stück ohne passende Verkaufszeile. Die Prämie "
+                      f"bleibt im Aktien-PnL eingebettet (potenzielle Doppelversteuerung) — "
+                      f"bitte Trades des Underlyings prüfen.")
+
+        # Interne Row-Identität nach dem Matching entfernen (kein Export-Leak).
+        for row in debug_rows:
+            row.pop('_trade_oid', None)
 
         # Apply per-trade gain/loss split (replaces old pauschal: stocks_gain -= stk_premium)
         stocks_gain -= stk_gain_corr_cy
@@ -3874,6 +4326,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             "stk_correction_cy": stk_gain_corr_cy + stk_loss_corr_cy,
             "etf_correction_cy": etf_gain_corr_cy + etf_loss_corr_cy,
             "stillhalter_unmatched": stillhalter_unmatched,
+            "stillhalter_corrections_dropped": stillhalter_corrections_dropped,
+            "stillhalter_open_short": stillhalter_open_short,
             "stillhalter_details": stillhalter_details,
             "cross_year_premium_eur": cross_year_premium_eur,
             "cross_year_by_year": cross_year_by_year,

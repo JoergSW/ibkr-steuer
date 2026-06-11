@@ -589,6 +589,11 @@ def merge_report_data(reports):
         'prior_zufluss_correction_eur': sum(r.get('audit', {}).get('prior_zufluss_correction_eur', 0) for r in reports),
         'prior_zufluss_details': [],
         'zufluss_unmatched': [],
+        'stillhalter_corrections_dropped': [],
+        'stillhalter_open_short': [],
+        'stk_correction_cy': sum(r.get('audit', {}).get('stk_correction_cy', 0) for r in reports),
+        'etf_correction_cy': sum(r.get('audit', {}).get('etf_correction_cy', 0) for r in reports),
+        'put_nosell_premium_eur': sum(r.get('audit', {}).get('put_nosell_premium_eur', 0) for r in reports),
     }
     for r in reports:
         a = r.get('audit', {})
@@ -598,6 +603,8 @@ def merge_report_data(reports):
         merged_audit['zufluss_details'].extend(a.get('zufluss_details', []))
         merged_audit['prior_zufluss_details'].extend(a.get('prior_zufluss_details', []))
         merged_audit['zufluss_unmatched'].extend(a.get('zufluss_unmatched', []))
+        merged_audit['stillhalter_corrections_dropped'].extend(a.get('stillhalter_corrections_dropped', []))
+        merged_audit['stillhalter_open_short'].extend(a.get('stillhalter_open_short', []))
         for year, val in a.get('cross_year_by_year', {}).items():
             merged_audit['cross_year_by_year'][year] = merged_audit['cross_year_by_year'].get(year, 0) + val
     merged['audit'] = merged_audit

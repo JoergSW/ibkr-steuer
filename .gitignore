@@ -30,3 +30,6 @@ verify_*.py
 .idea/
 CLAUDE.md
 test_data/
+
+# Claude Code local config (agents, settings) — internal, stays local like CLAUDE.md
+.claude/

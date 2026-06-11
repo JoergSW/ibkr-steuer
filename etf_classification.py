@@ -124,7 +124,6 @@ ETF_CLASSIFICATION = {
     # --- Energie (physische Aktienholdings) ---
     'US78468R5569': ('XOP',  'SPDR S&P Oil & Gas Exploration & Production ETF',  'aktienfonds'),   # cbonds /etf/735/
     'US92189H6071': ('OIH',  'VanEck Oil Services ETF',                          'aktienfonds'),   # cbonds /etf/269/
-    'US00162Q4525': ('AMLP', 'Alerian MLP ETF',                                  'aktienfonds'),   # cbonds /etf/77/
 
     # --- Thematische / aktiv gemanagte Aktien-ETFs ---
     'US00214Q1040': ('ARKK', 'ARK Innovation ETF',                              'aktienfonds'),   # cbonds /etf/11013/
@@ -313,6 +312,12 @@ ETF_CLASSIFICATION = {
     # --- Sonstige Strategie-ETFs ---
     'US00162Q1067': ('BTAL', 'AGF U.S. Market Neutral Anti-Beta Fund',           'sonstiger_fonds'),
     'US37950E4733': ('MLPA', 'Global X MLP ETF',                                 'sonstiger_fonds'),
+    # AMLP hält ausschließlich MLP-Units (Publicly Traded Partnerships =
+    # Personengesellschaften). Kapitalbeteiligungen i.S.d. §2 Abs. 8 InvStG sind
+    # nur Anteile an KAPITALgesellschaften — MLP-Units zählen NICHT zur
+    # Aktienquote → 0% Teilfreistellung statt 30% (wie MLPA, gleiche Assetklasse).
+    # Audit-Fix H2 2026-06-10. Quelle: SSGA/ALPS-Prospekt, 100% MLP/PTP-Holdings.
+    'US00162Q4525': ('AMLP', 'Alerian MLP ETF',                                  'sonstiger_fonds'),
 
     # ═══════════════════════════════════════════════════════════════════════════
     # NO_INVSTG — Kein Investmentfonds i.S.d. InvStG

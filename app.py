@@ -589,6 +589,7 @@ def merge_report_data(reports):
         'prior_zufluss_correction_eur': sum(r.get('audit', {}).get('prior_zufluss_correction_eur', 0) for r in reports),
         'prior_zufluss_details': [],
         'zufluss_unmatched': [],
+        'occ_rename_matches': [],
         'stillhalter_corrections_dropped': [],
         'stillhalter_open_short': [],
         'stk_correction_cy': sum(r.get('audit', {}).get('stk_correction_cy', 0) for r in reports),
@@ -603,6 +604,7 @@ def merge_report_data(reports):
         merged_audit['zufluss_details'].extend(a.get('zufluss_details', []))
         merged_audit['prior_zufluss_details'].extend(a.get('prior_zufluss_details', []))
         merged_audit['zufluss_unmatched'].extend(a.get('zufluss_unmatched', []))
+        merged_audit['occ_rename_matches'].extend(a.get('occ_rename_matches', []))
         merged_audit['stillhalter_corrections_dropped'].extend(a.get('stillhalter_corrections_dropped', []))
         merged_audit['stillhalter_open_short'].extend(a.get('stillhalter_open_short', []))
         for year, val in a.get('cross_year_by_year', {}).items():
@@ -917,6 +919,22 @@ if unmatched:
     <strong style="color: #fb923c;">Stillhalter-Warnung:</strong> Für {len(unmatched)} Assignment(s) wurde der ursprüngliche Optionsverkauf nicht gefunden: <strong>{details}</strong>.
     Die Option wurde vermutlich in einem Vorjahr verkauft (Prämie kassiert) und erst im Steuerjahr assigned. Ohne den Original-Trade kann die Prämie nicht berechnet und verbleibt in Topf 1 (Aktien) statt Topf 2 (Sonstiges).
     <br><em>Lösung:</em> Das Vorjahres-XML, in dem die Option verkauft wurde, oben als "Vorjahres-XML" hochladen.
+</div>
+""", unsafe_allow_html=True)
+
+occ_rename_matches = d.get('audit', {}).get('occ_rename_matches', [])
+if occ_rename_matches:
+    occ_lines = "<br>".join(
+        f"<strong>{m['sell_symbol']}</strong> (verkauft {m['sell_date']}) &rarr; "
+        f"<strong>{m['close_symbol']}</strong> (geschlossen {m['close_date']}, {m['quantity']} Kontrakt(e))"
+        for m in occ_rename_matches
+    )
+    st.markdown(f"""
+<div style="background: rgba(56,189,248,0.08); border: 1px solid rgba(56,189,248,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8; line-height: 1.6;">
+    <strong style="color: #38bdf8;">Kapitalmaßnahme erkannt (Umbenennung der Optionsserie):</strong>
+    Bei {len(occ_rename_matches)} Position(en) wurde die Optionsserie nach einer Kapitalmaßnahme (z.B. Spinoff oder Merger) von der Optionsbörse umbenannt; Strike, Verfall und Optionstyp sind identisch.
+    Die Schließung wurde automatisch dem ursprünglichen Verkauf zugeordnet, damit die Stillhalterprämie nur einmal versteuert wird:<br>{occ_lines}<br>
+    <span style="color: #64748b; font-size: 0.75rem;">Bitte prüfen: Falls es sich wider Erwarten um zwei verschiedene Kontrakte handelt, die Positionen in den Trade-Details kontrollieren.</span>
 </div>
 """, unsafe_allow_html=True)
 

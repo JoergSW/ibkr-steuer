@@ -1787,6 +1787,96 @@ def test_worthless_expiry_without_history_warns_unmatched():
     print("    NOHIST 499.00 als doppelt-versteuert-Risiko gemeldet")
 
 
+def test_occ_renamed_series_close_matches_original_sell():
+    """TC33: OCC-Umbenennung (Spinoff): Close unter MMM1 schliesst den SELL unter MMM.
+
+    Real-Fall Konvex 2024 (Solventum-Spinoff der 3M Company, 01.04.2024): Put
+    verkauft unter MMM, nach der Kapitalmassnahme unter MMM1 zurueckgekauft.
+    Ohne Familien-Matching galt der SELL als offen -> Praemie doppelt erfasst
+    (Zufluss-Praemie UND Rueckkauf-PnL) plus falsche unmatched-Warnung.
+    """
+    trades = [
+        make_sell("2024-01-23", 1, 1.40, strike="80", expiry="2024-07-19",
+                  underlying="MMM", commission=-0.80076),
+        make_buy_close("2024-04-11", 1, 0.25, 113.40239, strike="80",
+                       expiry="2024-07-19", underlying="MMM1"),
+    ]
+    rd = calculate_for_trades(trades, tax_year=2024)
+    audit = rd.get("audit", {})
+
+    assert_close(audit.get("zufluss_premium_eur", 0), 0.0,
+                 label="TC33 zufluss_premium_eur")
+    unmatched = audit.get("zufluss_unmatched", [])
+    assert unmatched == [], f"TC33: unerwartete unmatched-Warnung: {unmatched}"
+    assert_close(rd.get("options_gain_eur", 0), 113.40239,
+                 label="TC33 options_gain (nur Rueckkauf-PnL, keine Doppelzaehlung)")
+    # Transparenz: Familien-Match wird als occ_rename_match getrackt (GUI-Hinweis)
+    renames = audit.get("occ_rename_matches", [])
+    assert len(renames) == 1, f"TC33: erwartet 1 occ_rename_match, aktuell {renames}"
+    assert renames[0]["sell_underlying"] == "MMM"
+    assert renames[0]["close_underlying"] == "MMM1"
+    assert renames[0]["quantity"] == 1
+
+    print("  TC33 OCC-Umbenennung: MMM1-Close matcht MMM-SELL, keine Doppelzaehlung: OK")
+    print("    options_gain 113.40 EUR statt 252.64 EUR, occ_rename_match getrackt")
+
+
+def test_occ_family_prefers_exact_series():
+    """TC34: Koexistieren Original- und adjusted Serie, gewinnt der exakte Key.
+
+    Der MMM1-Close konsumiert den (juengeren) MMM1-SELL, NICHT den aelteren
+    MMM-SELL — der Familien-Fallback greift nur fuer sonst unmatchte Closes.
+    """
+    trades = [
+        make_sell("2024-02-01", 1, 2.00, strike="80", expiry="2024-07-19",
+                  underlying="MMM", commission=0.0),
+        make_sell("2024-03-01", 1, 3.00, strike="80", expiry="2024-07-19",
+                  underlying="MMM1", commission=0.0),
+        make_buy_close("2024-04-11", 1, 0.50, 250.0, strike="80",
+                       expiry="2024-07-19", underlying="MMM1"),
+    ]
+    rd = calculate_for_trades(trades, tax_year=2024)
+    audit = rd.get("audit", {})
+
+    # MMM1-SELL (300) konsumiert, MMM-SELL (200) bleibt offener Zufluss
+    assert_close(audit.get("zufluss_premium_eur", 0), 200.0,
+                 label="TC34 zufluss_premium_eur (nur MMM-SELL offen)")
+    zd = [d for d in audit.get("zufluss_details", []) or []
+          if d.get("underlyingSymbol") == "MMM"]
+    assert len(zd) == 1, \
+        f"TC34: erwartet MMM als offenen Zufluss, aktuell {audit.get('zufluss_details')}"
+    # Exakter Match ist KEIN Rename-Fall: kein occ_rename_match, kein GUI-Hinweis
+    assert audit.get("occ_rename_matches", []) == [], \
+        f"TC34: exakter Match darf kein occ_rename_match erzeugen: {audit.get('occ_rename_matches')}"
+
+    print("  TC34 Exact-Key-Prioritaet: MMM1-Close konsumiert MMM1-SELL zuerst: OK")
+    print("    MMM-SELL bleibt offener Zufluss (200.00 EUR)")
+
+
+def test_fop_digit_suffix_not_grouped():
+    """TC35: FOP-Underlyings mit legitimen Ziffern-Suffixen (ESZ4/ESZ5) bleiben getrennt."""
+    trades = [
+        make_sell("2024-02-01", 1, 2.00, strike="5000", expiry="2024-06-21",
+                  underlying="ESZ4", a_cat="FOP", multiplier="50", commission=0.0),
+        make_buy_close("2024-04-11", 1, 0.50, 150.0, strike="5000",
+                       expiry="2024-06-21", underlying="ESZ5", a_cat="FOP",
+                       multiplier="50"),
+    ]
+    rd = calculate_for_trades(trades, tax_year=2024)
+    audit = rd.get("audit", {})
+
+    # Keine Familien-Zuordnung: ESZ4-SELL bleibt offener Zufluss (2.00 x 50),
+    # der ESZ5-Close bleibt unmatched und wird gewarnt.
+    assert_close(audit.get("zufluss_premium_eur", 0), 100.0,
+                 label="TC35 zufluss_premium_eur (ESZ4 bleibt offen)")
+    unmatched = audit.get("zufluss_unmatched", [])
+    assert len(unmatched) == 1 and unmatched[0]["underlyingSymbol"] == "ESZ5", \
+        f"TC35: erwartet ESZ5-unmatched-Warnung, aktuell {unmatched}"
+
+    print("  TC35 FOP-Ziffern-Suffix wird NICHT als OCC-Familie gruppiert: OK")
+    print("    ESZ4-Zufluss 100.00 EUR bleibt, ESZ5-Close warnt unmatched")
+
+
 if __name__ == "__main__":
     test_cross_year_put_series()
     test_cross_year_call_series()
@@ -1820,4 +1910,7 @@ if __name__ == "__main__":
     test_call_correction_targets_assignment_row_not_unrelated_same_day_trade()
     test_worthless_expiry_without_history_warns_unmatched()
     test_put_correction_prefers_matching_lot_cost_row()
-    print("\nOK: alle 32 TCs gruen")
+    test_occ_renamed_series_close_matches_original_sell()
+    test_occ_family_prefers_exact_series()
+    test_fop_digit_suffix_not_grouped()
+    print("\nOK: alle 35 TCs gruen")

@@ -2277,6 +2277,20 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         return (t.get('assetCategory'), t.get('underlyingSymbol', ''),
                 t.get('strike'), t.get('expiry'), t.get('putCall'))
 
+    def _occ_family_key(key):
+        # OCC-adjusted Serien nach Kapitalmassnahmen (Spinoff/Merger) haengen eine
+        # Ziffer an das Underlying an (MMM -> MMM1), strike/expiry/putCall bleiben
+        # identisch. IBKRs eigenes FIFO verknuepft Close und Open ueber die
+        # Umbenennung hinweg (fifoPnlRealized enthaelt die Praemie) — ohne
+        # Familien-Matching gilt der Original-SELL faelschlich als offen und die
+        # Praemie wird doppelt erfasst (Zufluss + Rueckkauf-PnL). Nur fuer OPT:
+        # FOP-Underlyings (z.B. ESZ4) tragen legitime Ziffern-Suffixe.
+        if key[0] != 'OPT':
+            return key
+        und = key[1] or ''
+        root = und.rstrip('0123456789')
+        return (key[0], root or und, key[2], key[3], key[4])
+
     def _option_sort_key(t):
         return t.get('dateTime') or t.get('tradeDate') or t.get('reportDate') or ''
 
@@ -2357,9 +2371,20 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     # aktuelle Rückkäufe verbrauchen zuerst noch offene Vorjahres-Sells. Dadurch
     # werden aktuelle Sells nicht fälschlich als geschlossen behandelt und
     # Vorjahresprämien nur für tatsächlich im Steuerjahr geschlossene Lots korrigiert.
-    for key, events in series_events.items():
+    # Serien laufen pro OCC-Familie (siehe _occ_family_key): ein Close konsumiert
+    # zuerst Lots seiner exakten Serie, danach Lots umbenannter Schwester-Serien.
+    series_families = defaultdict(list)
+    for key in series_events:
+        series_families[_occ_family_key(key)].append(key)
+
+    # Transparenz: jede Familien-Fallback-Zuordnung (Close einer umbenannten
+    # Serie auf den Original-SELL) wird getrackt und in der GUI angezeigt.
+    occ_rename_matches = []
+
+    for fam_keys in series_families.values():
+        events = [(k, ev) for k in fam_keys for ev in series_events[k]]
         open_lots = []
-        for ev in sorted(events, key=_option_sort_key):
+        for k, ev in sorted(events, key=lambda pair: _option_sort_key(pair[1])):
             ev_date = parse_date(ev.get('reportDate') or ev.get('dateTime') or ev.get('tradeDate'))
             if not ev_date:
                 continue
@@ -2367,7 +2392,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                     and abs(safe_float(ev.get('fifoPnlRealized'))) < 0.01):
                 qty = abs(int(safe_float(ev.get('quantity'))))
                 if qty > 0:
-                    open_lots.append({'trade': ev, 'remaining': qty})
+                    open_lots.append({'trade': ev, 'remaining': qty, 'key': k})
                 continue
 
             close_qty = abs(int(safe_float(ev.get('quantity'))))
@@ -2380,24 +2405,52 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             is_buy_close = (ev.get('buySell') == 'BUY'
                             and abs(safe_float(ev.get('fifoPnlRealized'))) >= 0.01)
             remaining_close = close_qty
-            for lot in open_lots:
+            # Exact-Key-Priorität: koexistieren Original- und adjusted Serie
+            # (verschiedene Deliverables!), bleibt die eigene Serie zuerst dran;
+            # der Familien-Fallback greift nur für sonst unmatchte Closes.
+            for exact_pass in (True, False):
+                for lot in open_lots:
+                    if remaining_close <= 0:
+                        break
+                    if lot['remaining'] <= 0:
+                        continue
+                    if (lot['key'] == k) != exact_pass:
+                        continue
+                    take = min(lot['remaining'], remaining_close)
+                    sell_date = parse_date(lot['trade'].get('reportDate') or lot['trade'].get('dateTime') or lot['trade'].get('tradeDate'))
+                    if is_buy_close and ev_date.year == tax_year and sell_date and sell_date.year < tax_year:
+                        _add_prior_zufluss_detail(lot['key'], lot['trade'], take)
+                    if not exact_pass:
+                        occ_rename_matches.append({
+                            'sell_symbol': lot['trade'].get('symbol', ''),
+                            'sell_underlying': lot['key'][1],
+                            'sell_date': str(sell_date) if sell_date else '',
+                            'close_symbol': ev.get('symbol', ''),
+                            'close_underlying': k[1],
+                            'close_date': str(ev_date),
+                            'strike': k[2],
+                            'expiry': k[3],
+                            'putCall': k[4],
+                            'quantity': take,
+                        })
+                    lot['remaining'] -= take
+                    remaining_close -= take
                 if remaining_close <= 0:
                     break
-                if lot['remaining'] <= 0:
-                    continue
-                take = min(lot['remaining'], remaining_close)
-                sell_date = parse_date(lot['trade'].get('reportDate') or lot['trade'].get('dateTime') or lot['trade'].get('tradeDate'))
-                if is_buy_close and ev_date.year == tax_year and sell_date and sell_date.year < tax_year:
-                    _add_prior_zufluss_detail(key, lot['trade'], take)
-                lot['remaining'] -= take
-                remaining_close -= take
 
         for lot in open_lots:
             if lot['remaining'] <= 0:
                 continue
             sell_date = parse_date(lot['trade'].get('reportDate') or lot['trade'].get('dateTime') or lot['trade'].get('tradeDate'))
             if sell_date and sell_date.year == tax_year:
-                _add_current_zufluss(key, lot['trade'], lot['remaining'])
+                _add_current_zufluss(lot['key'], lot['trade'], lot['remaining'])
+
+    if occ_rename_matches:
+        renames = ", ".join(sorted({f"{m['sell_underlying']} -> {m['close_underlying']}"
+                                    for m in occ_rename_matches}))
+        print(f"  (i) Kapitalmassnahme erkannt: {len(occ_rename_matches)} Glattstellung(en) "
+              f"umbenannter Optionsserien dem Original-SELL zugeordnet ({renames}). "
+              f"Verhindert Doppelerfassung der Stillhalterpraemie.")
 
     for key, acc in current_zufluss_by_key.items():
         if acc['quantity'] <= 0 or acc['premium_raw'] == 0:
@@ -2512,6 +2565,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     # all_sell_open_keys contains current-year and prior-year openings from history.
 
     zufluss_unmatched = []
+    # Familien-Check analog zum Zufluss-FIFO: ein Close unter einer OCC-
+    # umbenannten Serie (MMM1) ist gematcht, wenn die Original-Serie (MMM)
+    # einen Eröffnungs-SELL hat — keine False-Positive-Warnung.
+    all_sell_open_family_keys = {_occ_family_key(k) for k in all_sell_open_keys}
     for t in trades:
         if t.get('assetCategory') not in ('OPT', 'FOP', 'FSFOP'):
             continue
@@ -2529,7 +2586,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             continue
         key = (t.get('assetCategory'), t.get('underlyingSymbol', ''),
                t.get('strike'), t.get('expiry'), t.get('putCall'))
-        if key not in all_sell_open_keys:
+        if key not in all_sell_open_keys and _occ_family_key(key) not in all_sell_open_family_keys:
             symbol = t.get('symbol') or t.get('description') or f"{key[1]} {key[2]} {key[3]} {key[4]}"
             # Avoid duplicate warnings for same instrument
             if not any(u.get('underlyingSymbol', '') == key[1]
@@ -4341,6 +4398,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             "prior_zufluss_correction_eur": prior_zufluss_correction_eur,
             "prior_zufluss_details": prior_zufluss_details,
             "zufluss_unmatched": zufluss_unmatched,
+            "occ_rename_matches": occ_rename_matches,
         }
     }
 
